@@ -1,0 +1,47 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # No dependencies needed: the suite runs the committed app.js directly.
+      - name: Verify Raft safety invariants
+        run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      # One-time manual step required before this ever succeeds:
+      #   Settings -> Pages -> Build and deployment -> Source: GitHub Actions
+      # `enablement: true` is deliberately NOT used here: creating a Pages
+      # site needs admin scope, which GITHUB_TOKEN does not have, so it fails
+      # with "Resource not accessible by integration".
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@v4

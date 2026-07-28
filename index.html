@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Raft Consensus — Interactive Visualizer</title>
+<script src="vendor/react.production.min.js"></script>
+<script src="vendor/react-dom.production.min.js"></script>
+<style>
+  :root{
+    --bg:#0b1020; --panel:#111830; --panel2:#0e1428; --line:#1f2b4d;
+    --txt:#e6ecff; --muted:#8aa0d0; --dim:#5a6c99;
+    --follower:#60a5fa; --candidate:#fbbf24; --leader:#34d399; --down:#ef4444;
+    --rv:#a78bfa; --pv:#f0abfc; --ae:#38bdf8; --grant:#34d399; --deny:#f87171;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:radial-gradient(1200px 700px at 30% -10%,#16204a 0%,var(--bg) 55%);
+    color:var(--txt);font-family:"Segoe UI",Inter,system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .app{max-width:1500px;margin:0 auto;padding:16px 18px 40px}
+  .head{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .head h1{font-size:21px;margin:0;font-weight:800;letter-spacing:.3px}
+  .head .sub{color:var(--muted);font-size:12.5px}
+  .stat{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+  .chip{background:#182247;border:1px solid var(--line);padding:5px 11px;
+    border-radius:999px;font-size:12px;color:var(--muted)}
+  .chip b{color:var(--txt)}
+  .bar{display:flex;gap:7px;flex-wrap:wrap;align-items:center;
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:8px 10px;margin-top:10px}
+  .bar+.bar{margin-top:7px}
+  .barlab{font-size:10.5px;font-weight:800;letter-spacing:1px;color:var(--dim);
+    text-transform:uppercase;margin-right:2px;min-width:64px}
+  button.btn{background:#1a2650;color:var(--txt);border:1px solid var(--line);
+    padding:7px 11px;border-radius:9px;font-size:12.5px;cursor:pointer;
+    transition:.15s;font-weight:600;white-space:nowrap}
+  button.btn:hover:not(:disabled){background:#243466;border-color:#33468a}
+  button.btn:disabled{opacity:.35;cursor:not-allowed}
+  button.btn.primary{background:#2b3f86;border-color:#3d57ad}
+  button.btn.on{background:#1d5c46;border-color:#2f8f6d;color:#c6f7e4}
+  button.btn.warn{background:#4a1d2a;border-color:#7a2f42;color:#ffd7de}
+  .sep{width:1px;height:24px;background:var(--line);margin:0 3px}
+  .sl{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted)}
+  .sl input{accent-color:#4f7cff;width:92px}
+  .sl b{color:var(--txt);min-width:38px;font-size:12px}
+  .grid{display:grid;grid-template-columns:1fr 350px;gap:14px;
+    align-items:start;margin-top:14px}
+  @media(max-width:1180px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    overflow:hidden}
+  .card+.card{margin-top:14px}
+  .card h2{font-size:11.5px;margin:0;padding:10px 13px;color:var(--muted);
+    text-transform:uppercase;letter-spacing:1.1px;border-bottom:1px solid var(--line);
+    font-weight:800;display:flex;align-items:center;gap:8px}
+  svg.stage{display:block;width:100%;height:auto;border-radius:11px;
+    background:radial-gradient(620px 420px at 50% 42%,#0f1836 0%,#0a1024 70%)}
+  .legend{display:flex;flex-wrap:wrap;gap:8px 15px;padding:10px 13px;font-size:11.5px;
+    border-top:1px solid var(--line)}
+  .legend .it{display:flex;align-items:center;gap:6px;color:var(--muted)}
+  .dot{width:10px;height:10px;border-radius:50%;flex:none}
+  .hint{padding:8px 13px;color:var(--dim);font-size:11.5px;border-top:1px solid var(--line)}
+  .explain{padding:12px 14px}
+  .explain .ttl{font-size:14px;font-weight:800;margin-bottom:6px}
+  .explain .bd{font-size:12.5px;line-height:1.65;color:var(--muted)}
+  .explain .bd em{color:var(--txt);font-style:normal;font-weight:700}
+  .explain .why{margin-top:9px;padding-top:9px;border-top:1px dashed var(--line);
+    font-size:11.5px;color:var(--dim);line-height:1.6}
+  .log{height:250px;overflow-y:auto;padding:5px 9px;font-size:12px;
+    font-family:"Cascadia Code",Consolas,monospace;line-height:1.55}
+  .log .row{padding:2px 5px;border-radius:5px;display:flex;gap:7px}
+  .log .row:hover{background:#0e1734}
+  .log .t{color:var(--dim);min-width:42px}
+  .log .n{font-weight:800;min-width:26px}
+  .insp{padding:7px 9px;display:flex;flex-direction:column;gap:7px}
+  .nrow{background:var(--panel2);border:1px solid var(--line);border-radius:9px;
+    padding:7px 9px}
+  .nrow .top{display:flex;align-items:center;gap:7px;font-size:12.5px}
+  .pill{font-size:9.5px;font-weight:900;letter-spacing:.6px;padding:2px 7px;
+    border-radius:999px;text-transform:uppercase}
+  .nrow .meta{color:var(--dim);font-size:11px;margin-top:5px;display:flex;
+    gap:10px;flex-wrap:wrap;font-family:Consolas,monospace}
+  .tobar{height:4px;background:#0a1024;border-radius:3px;margin-top:5px;overflow:hidden}
+  .tobar>i{display:block;height:100%;border-radius:3px}
+  .mini{margin-left:auto;font-size:10.5px;padding:3px 7px;border-radius:7px;
+    cursor:pointer;border:1px solid var(--line);background:#1a2650;color:var(--txt)}
+  .lrRow{display:flex;align-items:center;gap:9px;padding:6px 13px;
+    border-bottom:1px solid var(--line)}
+  .lrRow:last-child{border-bottom:none}
+  .lrName{min-width:92px;font-size:12px;font-weight:800;display:flex;
+    align-items:center;gap:6px}
+  .entries{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+  .ent{width:34px;height:34px;border-radius:7px;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;font-size:13px;font-weight:800;
+    line-height:1;border:1.5px solid}
+  .ent small{font-size:7.5px;font-weight:700;opacity:.85;margin-top:2px}
+  .ent.pending{opacity:.5;border-style:dashed}
+  .empty{color:var(--dim);font-size:11.5px;font-style:italic}
+  .tip{position:fixed;pointer-events:none;z-index:99;background:#0a1230;
+    border:1px solid #33468a;border-radius:9px;padding:8px 10px;font-size:11.5px;
+    font-family:Consolas,monospace;color:var(--txt);max-width:290px;
+    box-shadow:0 8px 26px #0008;line-height:1.5}
+  .tip .k{color:var(--dim)}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(function(){
+  function panic(title, detail){
+    var r=document.getElementById('root'); if(!r) return;
+    r.innerHTML='<div style="max-width:760px;margin:60px auto;padding:22px;'+
+      'border:1px solid #7a2f42;background:#2a1420;border-radius:14px;'+
+      'font-family:Consolas,monospace"><div style="font-size:17px;font-weight:800;'+
+      'color:#ffd7de;margin-bottom:10px">'+title+'</div><pre style="white-space:pre-wrap;'+
+      'color:#ffb3c0;margin:0;font-size:13px">'+detail+'</pre></div>';
+  }
+  window.__raftPanic=panic;
+  window.addEventListener('error',function(e){
+    panic('Script error',(e.message||'unknown')+'\n'+(e.filename||'')+':'+(e.lineno||''));
+  });
+  window.addEventListener('DOMContentLoaded',function(){
+    var miss=[];
+    if(!window.React) miss.push('React');
+    if(!window.ReactDOM) miss.push('ReactDOM');
+    if(miss.length){ panic('Libraries failed to load: '+miss.join(', '),
+      'Expected next to this page:\n  vendor/react.production.min.js\n'+
+      '  vendor/react-dom.production.min.js\n  app.js\n\n'+
+      'Keep the "vendor" folder beside this HTML file.'); return; }
+    setTimeout(function(){
+      var r=document.getElementById('root');
+      if(r&&r.children.length===0) panic('App did not mount',
+        'Libraries loaded but nothing rendered.\nPress F12 → Console for the real error.');
+    },2500);
+  });
+})();
+</script>
+
+<script src="app.js"></script>
+</body>
+</html>

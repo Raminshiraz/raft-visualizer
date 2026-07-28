@@ -1,0 +1,25 @@
+{
+  "name": "raft-visualizer",
+  "version": "1.0.0",
+  "description": "Interactive Raft consensus visualizer with one-way link cuts, network partitions and a headless safety-invariant test suite.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "raft",
+    "consensus",
+    "distributed-systems",
+    "visualization",
+    "leader-election",
+    "log-replication",
+    "teaching"
+  ],
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test/verify.mjs",
+    "serve": "python -m http.server 8080"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.25.0",
+    "@babel/preset-react": "^7.24.0"
+  }
+}
