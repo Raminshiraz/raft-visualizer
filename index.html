@@ -3,7 +3,48 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Raft Consensus — Interactive Visualizer</title>
+<title>Raft Consensus Visualizer — Interactive Leader Election &amp; Log Replication</title>
+<meta name="description" content="Interactive Raft consensus visualizer: step through leader election, log replication and split votes, then break the cluster with crashes, partitions and one-way links." />
+<meta name="author" content="raminshiraz" />
+<meta name="robots" content="index, follow, max-image-preview:large" />
+<link rel="canonical" href="https://raminshiraz.github.io/raft-visualizer/" />
+
+<!-- Google Search Console: paste the verification tag here, then use
+     URL Inspection -> Request Indexing.
+     <meta name="google-site-verification" content="..." /> -->
+
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="Raft Consensus Visualizer" />
+<meta property="og:url" content="https://raminshiraz.github.io/raft-visualizer/" />
+<meta property="og:title" content="Raft Consensus Visualizer — Interactive Leader Election &amp; Log Replication" />
+<meta property="og:description" content="Step through Raft leader election and log replication in the browser, then break the cluster with crashes, network partitions and one-way link cuts." />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Raft Consensus Visualizer" />
+<meta name="twitter:description" content="Interactive Raft simulator: leader election, log replication, split votes, partitions, one-way links, PreVote and the Figure 8 commit rule." />
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebApplication",
+  "name": "Raft Consensus Visualizer",
+  "url": "https://raminshiraz.github.io/raft-visualizer/",
+  "applicationCategory": "EducationalApplication",
+  "operatingSystem": "Any (web browser)",
+  "browserRequirements": "Requires JavaScript",
+  "description": "Interactive in-browser visualization of the Raft consensus algorithm: leader election, log replication, split votes, network partitions, one-way link cuts, PreVote and the previous-term commit rule.",
+  "author": {
+    "@type": "Person",
+    "name": "raminshiraz",
+    "url": "https://github.com/Raminshiraz"
+  },
+  "license": "https://opensource.org/licenses/MIT",
+  "isAccessibleForFree": true,
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "keywords": "Raft, consensus algorithm, distributed systems, leader election, log replication, visualization, simulator",
+  "codeRepository": "https://github.com/Raminshiraz/raft-visualizer"
+}
+</script>
+
 <script src="vendor/react.production.min.js"></script>
 <script src="vendor/react-dom.production.min.js"></script>
 <style>
@@ -101,10 +142,149 @@
     font-family:Consolas,monospace;color:var(--txt);max-width:290px;
     box-shadow:0 8px 26px #0008;line-height:1.5}
   .tip .k{color:var(--dim)}
+
+  /* Static, crawlable prose below the visualizer. Rendered without
+     JavaScript, so the page has real content for search engines and for
+     anyone whose browser never runs app.js. */
+  .about{max-width:860px;margin:0 auto;padding:8px 18px 56px;
+    font-family:"Segoe UI",Inter,system-ui,sans-serif;color:var(--muted);
+    font-size:14.5px;line-height:1.75}
+  .about h1{font-size:26px;line-height:1.3;color:var(--txt);font-weight:800;
+    margin:28px 0 10px}
+  .about h2{font-size:17px;color:var(--txt);font-weight:800;margin:30px 0 8px}
+  .about p{margin:0 0 12px}
+  .about ul{margin:0 0 12px;padding-left:20px}
+  .about li{margin-bottom:6px}
+  .about strong{color:var(--txt)}
+  .about code{font-family:"Cascadia Code",Consolas,monospace;font-size:13px;
+    background:var(--panel2);border:1px solid var(--line);border-radius:5px;
+    padding:1px 5px;color:var(--txt)}
+  .about a{color:#8ab4ff}
+  .about hr{border:none;border-top:1px solid var(--line);margin:30px 0}
+  .about .foot{font-size:12.5px;color:var(--dim)}
 </style>
 </head>
 <body>
 <div id="root"></div>
+
+<noscript>
+  <p style="max-width:860px;margin:24px auto;padding:0 18px;color:#8aa0d0;
+     font-family:'Segoe UI',Inter,system-ui,sans-serif">
+    The interactive simulation needs JavaScript. The written walkthrough below
+    describes everything it demonstrates.
+  </p>
+</noscript>
+
+<article class="about">
+  <h1>Interactive Raft Consensus Algorithm Visualizer</h1>
+
+  <p>
+    This page is a live, in-browser simulator of <strong>Raft</strong>, the
+    consensus algorithm that keeps a cluster of servers agreeing on a single
+    ordered log even while machines crash and the network misbehaves. Raft
+    powers etcd, Consul, TiKV, CockroachDB and many other systems. Watching it
+    run — leader election, heartbeats, log repair — is a much faster way to
+    understand it than reading Figure 2 of the paper cold.
+  </p>
+
+  <h2>What the Raft algorithm actually does</h2>
+  <p>
+    Every node is a <strong>follower</strong>, a <strong>candidate</strong> or
+    the <strong>leader</strong>. Time is divided into numbered
+    <em>terms</em>, and each term has at most one leader. The leader accepts
+    client commands, appends them to its log, and replicates them to everyone
+    else. A command is <strong>committed</strong> once a majority of the
+    cluster has stored it — at which point it can never be lost, even if the
+    leader dies the moment after.
+  </p>
+
+  <h2>Leader election, step by step</h2>
+  <p>
+    Each follower runs a randomized election timeout. If no heartbeat arrives
+    before it fires, that node bumps <code>currentTerm</code>, votes for
+    itself, becomes a candidate and sends <code>RequestVote</code> to every
+    peer. A node grants its vote at most once per term, and only to a
+    candidate whose log is at least as up to date as its own. Win a majority
+    and you are leader; the winner immediately starts sending
+    <code>AppendEntries</code> heartbeats to shut down every rival timer.
+  </p>
+  <p>
+    When two nodes time out simultaneously the result is a
+    <strong>split vote</strong>: neither reaches quorum, the term is wasted,
+    and the randomized timeouts resolve it on the next attempt. The
+    <em>Split vote</em> scenario on this page forces that situation on purpose
+    so you can watch a whole term go nowhere.
+  </p>
+
+  <h2>Log replication and log repair</h2>
+  <p>
+    <code>AppendEntries</code> carries <code>prevLogIndex</code> and
+    <code>prevLogTerm</code>. A follower rejects the message unless its own log
+    matches at that position, so the leader walks <code>nextIndex</code>
+    backwards until it finds the last point of agreement, then overwrites the
+    follower's divergent tail. The <em>Stale follower repair</em> scenario
+    stages a follower holding four entries from a dead leader's term and lets
+    you step through the backtracking and truncation one message at a time.
+  </p>
+  <p>
+    The subtlest rule in Raft is that a leader may only commit an entry from
+    its <strong>own</strong> term. The <em>Figure 8</em> scenario shows an old
+    entry replicated to all five nodes that still stays uncommitted — until a
+    fresh command in the current term commits both at once. Getting this rule
+    wrong is how implementations silently lose committed data.
+  </p>
+
+  <h2>Break the cluster: crashes, partitions and one-way links</h2>
+  <ul>
+    <li><strong>Crash a node</strong> — click it. <code>currentTerm</code>,
+      <code>votedFor</code> and the log survive the restart, because Raft
+      requires those to be persistent.</li>
+    <li><strong>Partition the network</strong> — split the cluster into
+      groups. The majority side keeps committing; the minority side spins its
+      term upward and commits nothing.</li>
+    <li><strong>Cut a single link, in one direction</strong> — click the wire
+      between two nodes to cycle it through healthy, fully cut, and each
+      one-way state. A node that can send but not receive times out forever
+      and keeps disrupting a perfectly healthy leader. Turn on
+      <strong>PreVote</strong> and watch the disruption stop.</li>
+    <li><strong>Degrade it</strong> — packet loss up to 60% and latency jitter
+      up to ±80%. Dropped messages die visibly in flight with the reason
+      attached.</li>
+  </ul>
+
+  <h2>Using the controls</h2>
+  <p>
+    Pick a scenario, then pause and use <em>Step</em> (120 ms) or
+    <em>Next event</em> to advance one message at a time; drop the speed to
+    0.5× for the repair walkthrough. Hover any in-flight message to inspect
+    the full RPC payload. <em>Client command</em> appends a new entry at the
+    leader. The explanation panel narrates the current phase and the reasoning
+    behind it, and the log panel records every state transition, vote and
+    commit.
+  </p>
+
+  <h2>Is the simulation correct?</h2>
+  <p>
+    It implements Figure 2 of the paper rather than animating a hand-waved
+    state machine, and a headless test suite drives the same engine the
+    browser runs, asserting Raft's four safety properties — Election Safety,
+    Log Matching, State Machine Safety and Leader Completeness — after every
+    simulated tick under randomized crashes, partitions, link cuts and packet
+    loss. Known simplifications: no log compaction or snapshots, and no joint
+    consensus for membership changes.
+  </p>
+
+  <hr />
+  <p class="foot">
+    Built by <a href="https://github.com/Raminshiraz">raminshiraz</a> · source and full notes on
+    <a href="https://github.com/Raminshiraz/raft-visualizer">GitHub</a> ·
+    based on
+    <a href="https://raft.github.io/raft.pdf">In Search of an Understandable
+    Consensus Algorithm</a> by Diego Ongaro and John Ousterhout (USENIX ATC
+    2014). MIT licensed.
+  </p>
+</article>
+
 <script>
 (function(){
   function panic(title, detail){

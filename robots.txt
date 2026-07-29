@@ -1,0 +1,10 @@
+# Crawlers only read robots.txt from a domain root, i.e.
+#   https://raminshiraz.github.io/robots.txt
+# This copy is therefore inert on a GitHub Pages project site and exists only
+# so the rules travel with the repo if it is ever served from its own domain.
+# The sitemap is submitted directly in Google Search Console instead.
+
+User-agent: *
+Allow: /
+
+Sitemap: https://raminshiraz.github.io/raft-visualizer/sitemap.xml
