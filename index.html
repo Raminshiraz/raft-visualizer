@@ -18,9 +18,14 @@
 <meta property="og:url" content="https://raminshiraz.github.io/raft-visualizer/" />
 <meta property="og:title" content="Raft Consensus Visualizer — Interactive Leader Election &amp; Log Replication" />
 <meta property="og:description" content="Step through Raft leader election and log replication in the browser, then break the cluster with crashes, network partitions and one-way link cuts." />
-<meta name="twitter:card" content="summary" />
+<meta property="og:image" content="https://raminshiraz.github.io/raft-visualizer/og-image.png" />
+<meta property="og:image:width" content="1200" />
+<meta property="og:image:height" content="630" />
+<meta property="og:image:alt" content="A five-node Raft cluster: the elected leader replicating entries to its followers, with one node standing as a candidate." />
+<meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="Raft Consensus Visualizer" />
 <meta name="twitter:description" content="Interactive Raft simulator: leader election, log replication, split votes, partitions, one-way links, PreVote and the Figure 8 commit rule." />
+<meta name="twitter:image" content="https://raminshiraz.github.io/raft-visualizer/og-image.png" />
 
 <script type="application/ld+json">
 {
@@ -31,6 +36,7 @@
   "applicationCategory": "EducationalApplication",
   "operatingSystem": "Any (web browser)",
   "browserRequirements": "Requires JavaScript",
+  "image": "https://raminshiraz.github.io/raft-visualizer/og-image.png",
   "description": "Interactive in-browser visualization of the Raft consensus algorithm: leader election, log replication, split votes, network partitions, one-way link cuts, PreVote and the previous-term commit rule.",
   "author": {
     "@type": "Person",
@@ -65,7 +71,8 @@
     -webkit-font-smoothing:antialiased}
   .app{max-width:1500px;margin:0 auto;padding:16px 18px 40px}
   .head{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-  .head h1{font-size:21px;margin:0;font-weight:800;letter-spacing:.3px}
+  .head h2{font-size:21px;margin:0;font-weight:800;letter-spacing:.3px;
+    color:var(--txt);text-transform:none;padding:0;border:none}
   .head .sub{color:var(--muted);font-size:12.5px}
   .stat{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
   .chip{background:#182247;border:1px solid var(--line);padding:5px 11px;

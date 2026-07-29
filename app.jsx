@@ -803,7 +803,10 @@ function App(){
   return (
     <div className="app">
       <div className="head">
-        <h1>⚙️ Raft Consensus Visualizer</h1>
+        {/* h2, not h1: the page's single <h1> is the static one in
+            index.html, which is what crawlers read on the first pass.
+            Still a heading, so it keeps its place in the outline. */}
+        <h2>⚙️ Raft Consensus Visualizer</h2>
         <span className="sub">leader election · log replication · partitions</span>
         <div className="stat">
           <span className="chip">term <b>{maxTerm}</b></span>

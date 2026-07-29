@@ -1036,7 +1036,7 @@ function App() {
     className: "app"
   }, /*#__PURE__*/React.createElement("div", {
     className: "head"
-  }, /*#__PURE__*/React.createElement("h1", null, "\u2699\uFE0F Raft Consensus Visualizer"), /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("h2", null, "\u2699\uFE0F Raft Consensus Visualizer"), /*#__PURE__*/React.createElement("span", {
     className: "sub"
   }, "leader election \xB7 log replication \xB7 partitions"), /*#__PURE__*/React.createElement("div", {
     className: "stat"
