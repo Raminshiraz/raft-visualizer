@@ -58,6 +58,7 @@ function makeNode(term, id){
     /* --- simulation-only bookkeeping --- */
     votes: {},            // id -> true, for the current election
     preVotes: {},         // id -> true, for the pre-vote round
+    preVoteTerm: 0,       // term this pre-vote round is probing for
     phase: null,          // 'prevote' while running a pre-vote round
     timeout: rand(ELECTION_MIN, ELECTION_MAX),
     timeoutInit: 0,
@@ -125,7 +126,7 @@ function stepDown(W, n, term, why){
   n.votedFor = null;          // new term, vote is fresh again
   n.state = 'follower';
   n.phase = null;
-  n.votes = {}; n.preVotes = {};
+  n.votes = {}; n.preVotes = {}; n.preVoteTerm = 0;
   n.leaderId = null;
   resetTimeout(W,n);
   if(was!=='follower') emit(W, n.id, `sees term ${term} ${why} → steps down from ${was.toUpperCase()} to FOLLOWER`, 'down');
@@ -143,15 +144,16 @@ function beginPreVote(W,n){
   n.phase = 'prevote';
   n.votes = {};
   n.leaderId = null;
+  n.preVoteTerm = n.currentTerm+1;   // the round these replies must belong to
   n.preVotes = { [n.id]: true };
   resetTimeout(W,n);
   emit(W, n.id, retry
-    ? `pre-vote for term ${n.currentTerm+1} failed → probes again, term stays ${n.currentTerm}`
-    : `timeout → PRE-VOTE probe for term ${n.currentTerm+1} (term not incremented yet)`, 'cand');
+    ? `pre-vote for term ${n.preVoteTerm} failed → probes again, term stays ${n.currentTerm}`
+    : `timeout → PRE-VOTE probe for term ${n.preVoteTerm} (term not incremented yet)`, 'cand');
   for(const o of W.nodes){
     if(o.id===n.id) continue;
     send(W, n.id, o.id, 'PreVote', {
-      term:n.currentTerm+1, candidateId:n.id,
+      term:n.preVoteTerm, candidateId:n.id,
       lastLogIndex:lastIndex(n), lastLogTerm:lastTerm(n),
     });
   }
@@ -163,7 +165,7 @@ function startElection(W,n){
   n.currentTerm++;            // §5.2: increment term...
   n.votedFor=n.id;            // ...vote for self...
   n.votes={ [n.id]:true };
-  n.preVotes={};
+  n.preVotes={}; n.preVoteTerm=0;
   n.leaderId=null;
   resetTimeout(W,n);          // ...reset timer, then fan out RequestVote
   emit(W, n.id, `becomes CANDIDATE for term ${n.currentTerm}, votes for itself`, 'cand');
@@ -271,12 +273,15 @@ function deliver(W, m){
     return;
   }
   if(m.type==='PreVoteReply'){
-    if(to.phase!=='prevote') return;
+    // A higher term demotes us whatever we are doing — check that first.
     if(p.term > to.currentTerm){ stepDown(W,to,p.term,'in a pre-vote reply'); return; }
+    if(to.phase!=='prevote') return;
+    if(p.forTerm !== to.preVoteTerm) return;   // reply from an older probe
     if(!p.granted) return;
     to.preVotes[m.from]=true;
-    if(Object.keys(to.preVotes).length >= quorum(nodeCount(W))){
-      emit(W, to.id, `pre-vote succeeded → now safe to increment term`, 'cand');
+    const pre = Object.keys(to.preVotes).length;
+    if(pre >= quorum(nodeCount(W))){
+      emit(W, to.id, `pre-vote carried ${pre}/${nodeCount(W)} → now safe to increment term`, 'cand');
       startElection(W,to);
     }
     return;
@@ -294,7 +299,12 @@ function deliver(W, m){
     const free    = to.votedFor===null || to.votedFor===p.candidateId;
     const fresh   = logIsUpToDate(p.lastLogTerm, p.lastLogIndex, to);
     const granted = free && fresh;
-    if(granted){ to.votedFor = p.candidateId; resetTimeout(W,to); }
+    if(granted){
+      to.votedFor = p.candidateId; resetTimeout(W,to);
+      // We backed someone else, so abandon any pre-vote probe of our own —
+      // otherwise the UI shows a "PRE-VOTE" node that has already voted.
+      to.phase=null; to.preVotes={}; to.preVoteTerm=0;
+    }
 
     const why = granted ? '' :
       !free  ? ` (already voted for N${to.votedFor} this term)` :
@@ -330,7 +340,7 @@ function deliver(W, m){
       emit(W, to.id, `recognises N${p.leaderId} as leader of term ${p.term} → FOLLOWER`, 'down');
     }
     to.state='follower'; to.phase=null; to.leaderId=p.leaderId;
-    to.votes={}; to.preVotes={};
+    to.votes={}; to.preVotes={}; to.preVoteTerm=0;
     resetTimeout(W,to);
     to.lastHeard=0;
 
@@ -761,12 +771,12 @@ function App(){
     } else {
       if(n.state==='down'){
         // currentTerm / votedFor / log are persistent — they survive the crash
-        n.state='follower'; n.votes={}; n.preVotes={}; n.phase=null;
+        n.state='follower'; n.votes={}; n.preVotes={}; n.preVoteTerm=0; n.phase=null;
         n.leaderId=null; n.lastHeard=ELECTION_MAX; resetTimeout(W,n);
         emit(W,n.id,`restarts as FOLLOWER — keeps term ${n.currentTerm}, votedFor ${n.votedFor===null?'∅':'N'+n.votedFor}, ${lastIndex(n)} log entries`,'sys');
       } else {
         const was=n.state;
-        n.state='down'; n.votes={}; n.preVotes={}; n.phase=null; n.leaderId=null;
+        n.state='down'; n.votes={}; n.preVotes={}; n.preVoteTerm=0; n.phase=null; n.leaderId=null;
         emit(W,n.id,`CRASHED (was ${was.toUpperCase()})`,'crash');
       }
     }
