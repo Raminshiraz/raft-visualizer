@@ -175,6 +175,94 @@ for (const key of Object.keys(X.SCENARIOS))
   run('scenario: ' + key, () => X.SCENARIOS[key].build(cfg()), 45000,
     (W, t) => { if (t % 2500 === 0) write(W, 's'); });
 
+// Safety must also hold with PreVote turned on.
+run('prevote + links + crashes + loss', () => X.makeWorld(5, cfg({ prevote: true, dropRate: 0.2, jitter: 0.5 })), 80000, (W, t) => {
+  if (t % 1800 === 0) flipLink(W, 5);
+  if (t % 3000 === 0) {
+    const n = W.nodes[Math.floor(Math.random() * 5)];
+    if (n.state === 'down') { n.state = 'follower'; n.timeout = 3000 + Math.random() * 3000; n.lastHeard = 6000; }
+    else if (W.nodes.filter(x => x.state !== 'down').length > 3) n.state = 'down';
+  }
+  if (t % 1100 === 0) write(W, 'q');
+});
+
+/* ------------------------------------------------------------------ *
+ *  PreVote — the whole point is that a node the leader cannot reach    *
+ *  must not be able to depose it. Assert that directly.                *
+ * ------------------------------------------------------------------ */
+function preVoteHoldsLeader(name, cutState, prevote, expectDisruption) {
+  const W = X.makeWorld(5, cfg({ prevote }));
+  let t = 0, L = null, baseTerm = 0, victim = null, deposed = false, maxTerm = 0;
+  while (t < 60000) {
+    X.tick(W, 40); t += 40;
+    const cur = W.nodes.find(n => n.state === 'leader');
+    if (!L && cur) {                       // once a leader exists, cut one wire
+      L = cur; baseTerm = cur.currentTerm;
+      victim = W.nodes.find(n => n.id !== L.id);
+      W.links[X.linkKey(L.id, victim.id)] = cutState;
+    }
+    if (L) {
+      if (cur && cur.id !== L.id) deposed = true;
+      maxTerm = Math.max(maxTerm, ...W.nodes.map(n => n.currentTerm));
+    }
+  }
+  const disrupted = deposed || maxTerm > baseTerm;
+  const ok = disrupted === expectDisruption;
+  if (!ok) failures++;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(36)} term ${baseTerm}->${maxTerm}  ` +
+    `leader ${deposed ? 'DEPOSED' : 'held'}  (expected ${expectDisruption ? 'disruption' : 'no disruption'})`);
+}
+
+// Both directions dead, and each one-way direction, must all be survivable.
+preVoteHoldsLeader('prevote: cut link, leader holds', 'cut', true, false);
+preVoteHoldsLeader('prevote: one-way lo2hi, holds', 'lo2hi', true, false);
+preVoteHoldsLeader('prevote: one-way hi2lo, holds', 'hi2lo', true, false);
+// Control: without PreVote the same cut MUST disrupt, or the test proves nothing.
+preVoteHoldsLeader('no prevote: same cut disrupts', 'cut', false, true);
+
+// A node that can send but never receive must not raise the cluster's term.
+{
+  const W = X.makeWorld(5, cfg({ prevote: true }));
+  for (let j = 0; j < 4; j++) W.links[X.linkKey(j, 4)] = 'lo2hi';
+  let t = 0;
+  while (t < 60000) { X.tick(W, 40); t += 40; }
+  const disruptor = W.nodes[4];
+  const others = W.nodes.slice(0, 4).map(n => n.currentTerm);
+  const ok = disruptor.currentTerm <= Math.max(...others) && disruptor.state !== 'leader';
+  if (!ok) failures++;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${'prevote: disruptor stays quiet'.padEnd(36)} ` +
+    `N4 term=${disruptor.currentTerm} state=${disruptor.state}  cluster terms=[${others}]`);
+}
+
+// PreVote must not cost liveness. It legitimately costs one extra round trip
+// (probe + reply) before the real election starts, so compare the median
+// against the same cluster with PreVote off rather than against a constant.
+{
+  const recover = (prevote) => {
+    const times = [];
+    for (let i = 0; i < 60; i++) {
+      const W = X.makeWorld(5, cfg({ prevote }));
+      let t = 0;
+      while (t < 30000 && !W.nodes.some(n => n.state === 'leader')) { X.tick(W, 40); t += 40; }
+      const L = W.nodes.find(n => n.state === 'leader');
+      L.state = 'down';
+      let e = 0;
+      while (e < 60000 && !W.nodes.some(n => n.state === 'leader' && n.id !== L.id)) { X.tick(W, 40); e += 40; }
+      times.push(e);
+    }
+    times.sort((a, b) => a - b);
+    return { med: times[30], max: times[times.length - 1] };
+  };
+  const off = recover(false), on = recover(true);
+  // One extra RTT is 2*TRAVEL = 1.4s; allow generous slack, but a regression
+  // that reintroduces wasted pre-vote rounds blows straight through this.
+  const ok = on.med <= off.med + 4000 && on.max < 60000;
+  if (!ok) failures++;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${'prevote: re-elect after crash'.padEnd(36)} ` +
+    `median ${(off.med / 1000).toFixed(1)}s -> ${(on.med / 1000).toFixed(1)}s  ` +
+    `max ${(off.max / 1000).toFixed(1)}s -> ${(on.max / 1000).toFixed(1)}s`);
+}
+
 // Liveness: a healthy cluster must elect promptly, every time.
 let slow = 0;
 for (let i = 0; i < 40; i++) {
