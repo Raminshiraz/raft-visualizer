@@ -250,13 +250,24 @@ function deliver(W, m){
 
   /* ---------------- PreVote ---------------- */
   if(m.type==='PreVote'){
-    // Grant only if we have NOT heard from a live leader recently. That is
-    // what stops a reconnecting minority node from disrupting the cluster.
-    const heardRecently = to.lastHeard < ELECTION_MIN;
+    // Grant only if we have NOT heard from a live leader within one minimum
+    // election timeout. That is what stops a node the leader cannot reach
+    // from disrupting a cluster that is otherwise perfectly healthy.
+    // A leader hears a leader every tick — itself — so it never grants.
+    const heardRecently = to.state==='leader' || to.lastHeard < ELECTION_MIN;
     const granted = !heardRecently
                  && p.term >= to.currentTerm+1
                  && logIsUpToDate(p.lastLogTerm, p.lastLogIndex, to);
     send(W, to.id, m.from, 'PreVoteReply', { term:to.currentTerm, granted, forTerm:p.term });
+    if(!granted){
+      const why = heardRecently
+          ? (to.state==='leader'    ? 'it is the LEADER and still heartbeating'
+           : to.leaderId!==null     ? `it still hears N${to.leaderId}`
+           :                          'it heard a leader too recently')
+        : p.term < to.currentTerm+1 ? `term ${p.term} is not ahead of ours ${to.currentTerm}`
+        : `its log ${p.lastLogTerm}/${p.lastLogIndex} is behind ours ${lastTerm(to)}/${lastIndex(to)}`;
+      emit(W, to.id, `denies pre-vote to N${p.candidateId}: ${why}`, 'deny');
+    }
     return;
   }
   if(m.type==='PreVoteReply'){
@@ -422,6 +433,7 @@ function tick(W, dt){
     n.lastHeard += dt;
 
     if(n.state==='leader'){
+      n.lastHeard = 0;        // a leader hears a leader continuously: itself
       n.hbTimer -= dt;
       if(n.hbTimer<=0){ broadcastAppendEntries(W,n); n.hbTimer = HEARTBEAT; }
     } else {
