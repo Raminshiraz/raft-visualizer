@@ -8,6 +8,7 @@ const ELECTION_MAX = 6000;   // ...high end. Spread prevents split votes.
 const HEARTBEAT    = 1000;   // leader -> followers, must be << ELECTION_MIN
 const TRAVEL       = 700;    // base one-way network latency
 const MAX_STEP     = 100;    // largest dt fed to step() in one go
+const NODE_R       = 33;     // drawn radius of a node, needed by the layout
 
 const rand  = (a,b)=> a + Math.random()*(b-a);
 const quorum = n => Math.floor(n/2)+1;
@@ -610,25 +611,40 @@ function computeLayout(nodes, W, H){
     return { pos, cx, cy, R, groups:[], split:false };
   }
 
-  // split the ring into one arc per group, separated by visible gaps
-  const GAP = 0.62;
+  // One arc of the ring per group, separated by visible gaps. The band drawn
+  // around a group is an annular SECTOR hugging its arc, not a bounding
+  // circle: a 3-of-5 group covers ~160° of the ring, so a circle enclosing it
+  // is very nearly the whole ring. Two of those overlap, swamp the canvas and
+  // push their labels off the top edge.
+  const GAP = 0.85;                    // empty radians between neighbouring arcs
+  const pad = (NODE_R+8)/R;            // angular half-width of a band's end cap
+  const ri  = R - NODE_R - 12;         // band inner radius
+  const ro  = R + NODE_R + 12;         // band outer radius
   const usable = 2*Math.PI - keys.length*GAP;
   let angle = -Math.PI/2 - Math.PI/keys.length;
   const shapes = [];
+  const at = (rad,ang)=> `${(cx+rad*Math.cos(ang)).toFixed(1)} ${(cy+rad*Math.sin(ang)).toFixed(1)}`;
   for(const k of keys){
     const members = groups[k];
     const span = usable * (members.length/nodes.length);
+    let first=0, last=0;
     members.forEach((n,i)=>{
       const a = members.length===1 ? angle+span/2
               : angle + span*(i/(members.length-1));
+      if(i===0) first=a;
+      last = a;
       pos[n.id] = { x:cx+R*Math.cos(a), y:cy+R*Math.sin(a) };
     });
-    const xs = members.map(n=>pos[n.id].x), ys = members.map(n=>pos[n.id].y);
-    const gx = xs.reduce((s,v)=>s+v,0)/xs.length;
-    const gy = ys.reduce((s,v)=>s+v,0)/ys.length;
-    let rad = 0;
-    members.forEach(n=>{ rad = Math.max(rad, Math.hypot(pos[n.id].x-gx, pos[n.id].y-gy)); });
-    shapes.push({ key:k, gx, gy, r:rad+58, size:members.length });
+    const a0=first-pad, a1=last+pad, mid=(a0+a1)/2;
+    const big = (a1-a0) > Math.PI ? 1 : 0;
+    shapes.push({
+      key:k, size:members.length,
+      d: `M ${at(ro,a0)} A ${ro} ${ro} 0 ${big} 1 ${at(ro,a1)}`
+       + ` L ${at(ri,a1)} A ${ri} ${ri} 0 ${big} 0 ${at(ri,a0)} Z`,
+      // label rides just outside the band, clamped so it cannot leave the frame
+      lx: Math.max(142, Math.min(W-142, cx+(ro+18)*Math.cos(mid))),
+      ly: Math.max(18,  Math.min(H-10,  cy+(ro+18)*Math.sin(mid))),
+    });
     angle += span + GAP;
   }
   return { pos, cx, cy, R, groups:shapes, split:true };
@@ -1078,7 +1094,7 @@ function Wire({a,b,pa,pb,st,onLink,onTip}){
 }
 
 function Stage({W,onClick,mode,onTip,onLink}){
-  const VW=700, VH=580, NR=33;
+  const VW=700, VH=580, NR=NODE_R;
   const nodes=W.nodes;
   const lay=computeLayout(nodes,VW,VH);
   const pos=lay.pos;
@@ -1099,9 +1115,9 @@ function Stage({W,onClick,mode,onTip,onLink}){
         const col = maj ? 'var(--leader)' : 'var(--down)';
         return (
           <g key={g.key}>
-            <circle cx={g.gx} cy={g.gy} r={g.r} fill={maj?'#0d2b22':'#2a1420'}
+            <path d={g.d} fill={maj?'#0d2b22':'#2a1420'}
               opacity="0.5" stroke={col} strokeWidth="1.5" strokeDasharray="7 6"/>
-            <text x={g.gx} y={g.gy-g.r-9} textAnchor="middle" fontSize="11"
+            <text x={g.lx} y={g.ly} textAnchor="middle" fontSize="11"
               fontWeight="800" fill={col} letterSpacing="1">
               NETWORK {GROUP_NAMES[g.key]} · {g.size} node{g.size>1?'s':''} · {maj?'MAJORITY':'minority — cannot elect'}
             </text>
