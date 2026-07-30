@@ -138,10 +138,16 @@ function beginPreVote(W,n){
   // PreVote (Ongaro thesis §9.6): probe for votes WITHOUT bumping our term,
   // so a partitioned node cannot inflate the cluster's term and disrupt a
   // healthy leader when it reconnects.
+  const retry = n.phase==='prevote';
+  n.state = 'follower';       // a failed campaign falls back; it never lingers
   n.phase = 'prevote';
+  n.votes = {};
+  n.leaderId = null;
   n.preVotes = { [n.id]: true };
   resetTimeout(W,n);
-  emit(W, n.id, `timeout → PRE-VOTE probe for term ${n.currentTerm+1} (term not incremented yet)`, 'cand');
+  emit(W, n.id, retry
+    ? `pre-vote for term ${n.currentTerm+1} failed → probes again, term stays ${n.currentTerm}`
+    : `timeout → PRE-VOTE probe for term ${n.currentTerm+1} (term not incremented yet)`, 'cand');
   for(const o of W.nodes){
     if(o.id===n.id) continue;
     send(W, n.id, o.id, 'PreVote', {
@@ -421,7 +427,10 @@ function tick(W, dt){
     } else {
       n.timeout -= dt;
       if(n.timeout<=0){
-        if(W.cfg.prevote && n.phase!=='prevote') beginPreVote(W,n);
+        // A pre-vote that failed retries as another PRE-VOTE. It must never
+        // fall through into a real election, or the whole mechanism is moot:
+        // the second timeout would bump the term and disrupt a live leader.
+        if(W.cfg.prevote) beginPreVote(W,n);
         else startElection(W,n);
       }
     }
