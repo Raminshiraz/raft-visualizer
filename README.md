@@ -4,6 +4,8 @@ An interactive, in-browser visualization of the [Raft consensus algorithm](https
 
 **[▶ Live demo - Use it here!](https://raminshiraz.github.io/raft-visualizer/)**
 
+![A five-node Raft cluster mid-replication: N0 wears the crown as leader of term 3, the four followers sit in sync, and AppendEntries acknowledgements travel back along the wires](demo.png)
+
 No build step, no bundler, no CDN. Open `index.html` and it runs.
 
 ---
