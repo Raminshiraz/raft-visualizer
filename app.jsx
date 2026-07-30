@@ -810,7 +810,12 @@ function App(){
     if(W.nodes.length<=3) return;
     const n=W.nodes.pop();
     W.msgs=W.msgs.filter(m=>m.from!==n.id&&m.to!==n.id);
-    W.nodes.forEach(o=>{ delete o.nextIndex[n.id]; delete o.matchIndex[n.id]; delete o.votes[n.id]; });
+    // Drop every trace of it, or a stale vote/matchIndex still counts toward
+    // a quorum that is now smaller than it was.
+    W.nodes.forEach(o=>{
+      delete o.nextIndex[n.id]; delete o.matchIndex[n.id];
+      delete o.votes[n.id];     delete o.preVotes[n.id];
+    });
     emit(W,n.id,`removed — quorum is now ${quorum(W.nodes.length)}/${W.nodes.length}`,'sys');
   };
 
