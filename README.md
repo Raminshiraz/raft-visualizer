@@ -2,7 +2,7 @@
 
 An interactive, in-browser visualization of the [Raft consensus algorithm](https://raft.github.io/raft.pdf) — leader election, log replication, and the failure modes that make Raft interesting.
 
-**[▶ Live demo](https://raminshiraz.github.io/raft-visualizer/)**
+**[▶ Live demo - Use it here!](https://raminshiraz.github.io/raft-visualizer/)**
 
 No build step, no bundler, no CDN. Open `index.html` and it runs.
 
