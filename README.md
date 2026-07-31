@@ -27,6 +27,7 @@ This one exists because both stop short of the parts that are hardest to underst
 | **Per-link cuts, including one-way** | — | — | ✅ |
 | **Log repair (`nextIndex` backtracking, truncation)** | partial | — | ✅ |
 | **Figure 8 — the previous-term commit rule** | — | — | ✅ |
+| **Figure 8 — the overwrite that rule prevents** | — | — | ✅ |
 | **PreVote** | — | — | ✅ |
 | **Safety invariants machine-checked** | — | — | ✅ |
 
@@ -46,7 +47,7 @@ That third one is the interesting one. A one-way cut models a node that is fully
 
 **Tune the network** — packet loss up to 60%, latency jitter up to ±80%. Dropped messages die visibly mid-flight with the reason attached.
 
-**Toggle real-world extensions** — PreVote and the leader no-op append, so you can watch what breaks without them.
+**Toggle real-world extensions** — PreVote and the leader no-op append, so you can watch what breaks without them. Two scenarios are built to be run both ways: *One-way link* with PreVote off then on, and *Figure 8 — the overwrite* with the no-op off then on. In each case the toggle is the only thing that changes, and it decides whether the cluster survives.
 
 **Step through it** — pause, step 120ms, or jump to the next event. Hover any in-flight message to inspect its full RPC payload.
 
@@ -88,23 +89,33 @@ $ npm test
 Raft safety verification — engine loaded from app.js
 
 PASS  healthy cluster + client writes      leader=y  maxCommit=22
-PASS  random crash / restart               leader=y  maxCommit=20
-PASS  flapping network partitions          leader=y  maxCommit=24
+PASS  random crash / restart               leader=y  maxCommit=22
+PASS  flapping network partitions          leader=y  maxCommit=26
 PASS  35% packet loss                      leader=y  maxCommit=12
-PASS  random link cuts (incl. one-way)     leader=y  maxCommit=8
-PASS  links + partitions + crashes + loss  leader=n  maxCommit=0
+PASS  random link cuts (incl. one-way)     leader=y  maxCommit=5
+PASS  links + partitions + crashes + loss  leader=y  maxCommit=0
 PASS  one-way isolated node cannot win     leader=y  maxCommit=0
 PASS  scenario: fresh                      leader=y  maxCommit=7
-PASS  scenario: killLeader                 leader=y  maxCommit=6
+PASS  scenario: killLeader                 leader=y  maxCommit=7
 PASS  scenario: splitVote                  leader=y  maxCommit=8
-PASS  scenario: partition                  leader=y  maxCommit=8
+PASS  scenario: partition                  leader=y  maxCommit=7
 PASS  scenario: repair                     leader=y  maxCommit=13
-PASS  scenario: asymmetric                 leader=y  maxCommit=3
+PASS  scenario: asymmetric                 leader=y  maxCommit=2
 PASS  scenario: figure8                    leader=y  maxCommit=10
+PASS  scenario: figure8Lost                leader=y  maxCommit=7
+PASS  prevote + links + crashes + loss     leader=y  maxCommit=6
+PASS  prevote: cut link, leader holds      term 1->1  leader held  (expected no disruption)
+PASS  prevote: one-way lo2hi, holds        term 1->1  leader held  (expected no disruption)
+PASS  prevote: one-way hi2lo, holds        term 1->1  leader held  (expected no disruption)
+PASS  no prevote: same cut disrupts        term 2->10  leader DEPOSED  (expected disruption)
+PASS  prevote: disruptor stays quiet       N4 term=0 state=follower  cluster terms=[2,2,2,2]
+PASS  prevote: re-elect after crash        median 4.3s -> 5.5s  max 13.5s -> 21.4s
 PASS  liveness: 40 cold starts             slow(>15s)=0
 
 ALL INVARIANTS HELD
 ```
+
+The PreVote rows are the ones to read as a pair. `no prevote: same cut disrupts` is a deliberate **negative control**: cutting one link from the leader must knock it out of office when PreVote is off, or the three rows above it — which assert the leader survives that same cut with PreVote on — would pass without proving anything.
 
 Checked continuously:
 
