@@ -3,8 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Raft Consensus Visualizer — Interactive Leader Election &amp; Log Replication</title>
-<meta name="description" content="Interactive Raft consensus visualizer: step through leader election, log replication and split votes, then break the cluster with crashes, partitions and one-way links." />
+<title>Raft Consensus Visualizer — Leader Election, Log Replication &amp; Two-Phase Commit</title>
+<meta name="description" content="Interactive Raft consensus visualizer: step through leader election, log replication and split votes, break the cluster with crashes, partitions and one-way links, then run a fault-tolerant two-phase commit across several Raft groups." />
 <meta name="author" content="raminshiraz" />
 <meta name="robots" content="index, follow, max-image-preview:large" />
 <link rel="canonical" href="https://raminshiraz.github.io/raft-visualizer/" />
@@ -18,15 +18,15 @@
 <meta property="og:type" content="website" />
 <meta property="og:site_name" content="Raft Consensus Visualizer" />
 <meta property="og:url" content="https://raminshiraz.github.io/raft-visualizer/" />
-<meta property="og:title" content="Raft Consensus Visualizer — Interactive Leader Election &amp; Log Replication" />
-<meta property="og:description" content="Step through Raft leader election and log replication in the browser, then break the cluster with crashes, network partitions and one-way link cuts." />
+<meta property="og:title" content="Raft Consensus Visualizer — Leader Election, Log Replication &amp; Two-Phase Commit" />
+<meta property="og:description" content="Step through Raft leader election and log replication in the browser, break the cluster with crashes, network partitions and one-way link cuts, then watch a distributed transaction commit atomically across replicated groups." />
 <meta property="og:image" content="https://raminshiraz.github.io/raft-visualizer/og-image.png" />
 <meta property="og:image:width" content="1200" />
 <meta property="og:image:height" content="630" />
 <meta property="og:image:alt" content="A five-node Raft cluster: the elected leader replicating entries to its followers, with one node standing as a candidate." />
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="Raft Consensus Visualizer" />
-<meta name="twitter:description" content="Interactive Raft simulator: leader election, log replication, split votes, partitions, one-way links, PreVote and the Figure 8 commit rule." />
+<meta name="twitter:description" content="Interactive Raft simulator: leader election, log replication, split votes, partitions, one-way links, PreVote, the Figure 8 commit rule and fault-tolerant two-phase commit." />
 <meta name="twitter:image" content="https://raminshiraz.github.io/raft-visualizer/og-image.png" />
 
 <script type="application/ld+json">
@@ -39,7 +39,7 @@
   "operatingSystem": "Any (web browser)",
   "browserRequirements": "Requires JavaScript",
   "image": "https://raminshiraz.github.io/raft-visualizer/og-image.png",
-  "description": "Interactive in-browser visualization of the Raft consensus algorithm: leader election, log replication, split votes, network partitions, one-way link cuts, PreVote and the previous-term commit rule.",
+  "description": "Interactive in-browser visualization of the Raft consensus algorithm: leader election, log replication, split votes, network partitions, one-way link cuts, PreVote, the previous-term commit rule, and fault-tolerant two-phase commit running across several Raft groups.",
   "author": {
     "@type": "Person",
     "name": "raminshiraz",
@@ -48,7 +48,7 @@
   "license": "https://opensource.org/licenses/MIT",
   "isAccessibleForFree": true,
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
-  "keywords": "Raft, consensus algorithm, distributed systems, leader election, log replication, visualization, simulator",
+  "keywords": "Raft, consensus algorithm, distributed systems, leader election, log replication, visualization, simulator, two-phase commit, 2PC, atomic commit, distributed transactions, Paxos Commit",
   "codeRepository": "https://github.com/Raminshiraz/raft-visualizer"
 }
 </script>
@@ -268,6 +268,44 @@
       attached.</li>
   </ul>
 
+  <h2>Two-phase commit on top of Raft</h2>
+  <p>
+    The second view, <em>2PC over Raft</em>, runs a distributed transaction
+    across several Raft groups at once — a coordinator group plus one to three
+    participant shards, each of them a full cluster with its own leader, term
+    and log. Two-phase commit is how a database makes one transaction atomic
+    across machines that do not share storage: the coordinator sends
+    <code>PREPARE</code>, every participant answers <code>PREPARED</code> or
+    refuses, and only then does the coordinator announce
+    <code>COMMIT</code> or <code>ABORT</code>.
+  </p>
+  <p>
+    Textbook 2PC has one notorious flaw, and you can reproduce it here in
+    about twenty seconds. Turn <strong>Replicated coordinator</strong> off so
+    the coordinator is a single machine, start a transaction, and crash it
+    once both shards show a lock. Every participant has promised it can
+    commit, none of them is allowed to guess, and the only node that could
+    release them is gone. Nothing times out. Nothing recovers. That is the
+    <strong>blocking problem</strong>, and retrying harder does not fix it.
+  </p>
+  <p>
+    The fix, from Gray and Lamport's <em>Consensus on Transaction Commit</em>,
+    is to stop writing the decision to one disk and start committing it to a
+    consensus group — which is what Spanner does, running 2PC across Paxos
+    groups. Turn the toggle back on and every 2PC record here becomes an
+    ordinary Raft log entry: the coordinator will not send a single
+    <code>PREPARE</code> until <code>BEGIN</code> is on a majority of its own
+    group, and no shard answers until its own vote is committed by its own
+    group. Watch the row of boxes under each bubble — faded and dashed while
+    the record is merely written, solid once it is durable. Nothing is ever
+    said out loud before its box goes solid. Now crash the coordinator's
+    leader again: a new one is elected, reads the decision straight out of the
+    replicated log, and finishes the transaction the dead machine started.
+    Crash a <em>shard</em> leader the instant its vote commits and the same
+    thing happens on the other side — its replacement answers
+    <code>PREPARED</code> for a transaction it has never heard of.
+  </p>
+
   <h2>Using the controls</h2>
   <p>
     Pick a scenario, then pause and use <em>Step</em> (120 ms) or
@@ -278,6 +316,17 @@
     behind it, and the log panel records every state transition, vote and
     commit.
   </p>
+  <p>
+    The <em>View</em> bar at the top switches between the single cluster and
+    the 2PC view; whichever one you are not watching is paused where you left
+    it. In the 2PC view the topology is yours to change: pick a group and add
+    or remove nodes — up to seven, down to one — and its log survives the
+    resize, so you can grow a group in the middle of a live transaction and
+    watch its quorum change under it. Adding or removing whole shards rebuilds
+    them, so that discards the transaction in progress and says so in the log.
+    Packet loss, jitter, PreVote and the leader no-op apply to every group at
+    once.
+  </p>
 
   <h2>Is the simulation correct?</h2>
   <p>
@@ -286,8 +335,16 @@
     browser runs, asserting Raft's four safety properties — Election Safety,
     Log Matching, State Machine Safety and Leader Completeness — after every
     simulated tick under randomized crashes, partitions, link cuts and packet
-    loss. Known simplifications: no log compaction or snapshots, and no joint
-    consensus for membership changes.
+    loss. The 2PC layer is checked the same way, per group and on top: no two
+    shards may reach opposite outcomes, a committed decision may never change,
+    and no shard may apply anything the coordinator has not committed. One row
+    is a deliberate negative control — with an unreplicated coordinator the
+    transaction <em>must</em> block, or the rows proving that replication
+    rescues it would prove nothing. Known simplifications: no log compaction
+    or snapshots, no joint consensus for membership changes, one transaction
+    at a time, and presumed abort with no cooperative termination protocol —
+    participants never ask each other how it ended, because the blocking is
+    the point.
   </p>
 
   <hr />

@@ -13,7 +13,8 @@ import path from 'node:path';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 let code = fs.readFileSync(path.join(here, '..', 'app.js'), 'utf8');
-code += '\n;globalThis.__X={makeWorld,tick,SCENARIOS,quorum,broadcastAppendEntries,linkKey,LINK_CYCLE};';
+code += '\n;globalThis.__X={makeWorld,tick,SCENARIOS,quorum,broadcastAppendEntries,linkKey,LINK_CYCLE,'
+      + 'makeTxnWorld,tickTxn,beginTxn,txnPhase,shardFate,coordFate,groupLeader,committedOn,TXN_SCENARIOS};';
 
 // Minimal DOM/React stubs — we only exercise the simulation core.
 const sandbox = {
@@ -273,6 +274,189 @@ for (let i = 0; i < 40; i++) {
 }
 if (slow) failures++;
 console.log(`${slow ? 'FAIL' : 'PASS'}  ${'liveness: 40 cold starts'.padEnd(36)} slow(>15s)=${slow}`);
+
+/* ------------------------------------------------------------------ *
+ *  Two-phase commit over Raft                                          *
+ *                                                                      *
+ *  Raft safety is asserted per group, unchanged. On top of that, the    *
+ *  properties an atomic commit protocol owes you: everyone reaches the  *
+ *  same outcome, the outcome never changes once it is durable, and      *
+ *  nobody applies anything the coordinator has not committed.           *
+ * ------------------------------------------------------------------ */
+const txnCfg = o => cfg({ noop: true, ...o });
+const shardsOf = T => T.groups.filter(g => g.role === 'shard');
+
+function checkTxn(T, S, viol) {
+  // Raft safety inside every group. The memory MUST be per group: check()'s
+  // committed map is keyed by bare log index, so one shared S would conflate
+  // index 3 of COORD with index 3 of SHARD B and fail for no reason.
+  for (const g of T.groups) {
+    if (!S.raft[g.id]) S.raft[g.id] = { leaderOfTerm: new Map(), committed: new Map() };
+    check(g.W, S.raft[g.id], viol);
+  }
+  if (!T.txn) return;
+  const id = T.txn.id;
+
+  // Atomicity — no two shards may reach opposite outcomes.
+  const applied = shardsOf(T).map(g => X.shardFate(T, g, id).applied).filter(Boolean);
+  if (applied.some(d => d !== applied[0]))
+    viol.push(`2PC ATOMICITY: ${id} applied as ${[...new Set(applied)].join(' and ')} on different shards`);
+
+  // Decision stability — snapshot on first sight; it must never move.
+  const dec = X.coordFate(T, id).decision;
+  if (dec) {
+    if (S.decision[id] === undefined) S.decision[id] = dec;
+    else if (S.decision[id] !== dec)
+      viol.push(`2PC DECISION STABILITY: ${id} committed as ${S.decision[id]}, now reads ${dec}`);
+  }
+
+  // No premature apply. Checked against the sticky snapshot, not the live
+  // coordinator: a fresh coordinator leader can legitimately show a lower
+  // commitIndex than the leader that committed the decision.
+  for (const d of applied) {
+    if (S.decision[id] === undefined)
+      viol.push(`2PC PREMATURE APPLY: a shard applied ${d} for ${id} with no committed coordinator decision`);
+    else if (S.decision[id] !== d)
+      viol.push(`2PC PREMATURE APPLY: a shard applied ${d} for ${id}, but the decision was ${S.decision[id]}`);
+  }
+
+  // No double record — the dedupe guard is what stops a crash committing both
+  // an abort and a commit for the same transaction.
+  for (const g of T.groups)
+    for (const n of g.W.nodes) {
+      const c = {};
+      for (const e of n.log) if (e.txn === id && e.rec) c[e.rec] = (c[e.rec] || 0) + 1;
+      for (const r of ['begin', 'decision', 'prepared', 'novote', 'applied'])
+        if (c[r] > 1) viol.push(`2PC DOUBLE RECORD: ${g.name} N${n.id} holds ${c[r]} ${r} records for ${id}`);
+      if ((c.prepared || 0) + (c.novote || 0) > 1)
+        viol.push(`2PC DOUBLE RECORD: ${g.name} N${n.id} holds both a yes and a no vote for ${id}`);
+    }
+}
+
+function runTxn(name, build, ms, chaos, verdict) {
+  const T = build();
+  const S = { raft: {}, decision: {} };
+  const viol = [];
+  let t = 0;
+
+  while (t < ms) {
+    X.tickTxn(T, 40); t += 40;
+    if (chaos) chaos(T, t);
+    checkTxn(T, S, viol);
+    if (viol.length) break;
+  }
+
+  const fates = shardsOf(T).map(g => X.shardFate(T, g));
+  const info = {
+    T, phase: X.txnPhase(T), shards: fates.length,
+    locked: fates.filter(f => f.locked).length,
+    applied: fates.filter(f => f.applied).length,
+  };
+  const v = verdict ? verdict(info) : { ok: true, text: '' };
+  const ok = viol.length === 0 && v.ok;
+  if (!ok) failures++;
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(36)} ${v.text}`);
+  viol.slice(0, 3).forEach(v2 => console.log('        ! ' + v2));
+  return ok;
+}
+
+const buildTxn = (coord, shards, o) => X.makeTxnWorld(coord, shards, txnCfg(o));
+const tally = i => `phase=${i.phase}  applied=${i.applied}/${i.shards}  locked=${i.locked}`;
+
+/** Fire `f` the first time `when` holds, once per run. */
+const once = (T, key, when, f) => { if (!T[key] && when()) { f(); T[key] = true; } };
+const allVotedYes = T => shardsOf(T).every(g => X.shardFate(T, g).vote === 'yes');
+
+console.log('');
+
+runTxn('2pc: happy path commits everywhere', () => buildTxn(3, [3, 3]), 60000,
+  (T, t) => { if (t === 2000) X.beginTxn(T); },
+  i => ({ ok: i.phase === 'committed' && i.applied === i.shards, text: tally(i) }));
+
+runTxn('2pc: a NO vote aborts everywhere', () => {
+  const T = buildTxn(3, [3, 3]); T.groups[2].willVote = 'no'; return T;
+}, 60000,
+  (T, t) => { if (t === 2000) X.beginTxn(T); },
+  i => ({ ok: i.phase === 'aborted' && i.applied === i.shards, text: tally(i) }));
+
+// The marquee case: the only node that ever spoke to the coordinator dies, and
+// a replacement that never saw the request answers for it out of the log.
+runTxn('2pc: shard leader dies, log answers', () => buildTxn(3, [3, 3]), 90000,
+  (T, t) => {
+    if (t === 2000) X.beginTxn(T);
+    once(T, '_k', () => T.txn && X.shardFate(T, T.groups[1]).vote === 'yes' && X.groupLeader(T.groups[1]),
+      () => { X.groupLeader(T.groups[1]).state = 'down'; });
+  },
+  i => ({ ok: i.T._k && i.phase === 'committed' && i.applied === i.shards, text: tally(i) }));
+
+/* NEGATIVE CONTROL. Without this row, "replicated coord recovers" proves
+   nothing: a transaction that would have finished anyway also finishes with
+   replication on. An unreplicated coordinator MUST leave the shards stuck. */
+runTxn('2pc: lone coordinator BLOCKS (ctl)', () => buildTxn(1, [3, 3]), 60000,
+  (T, t) => {
+    if (t === 2000) X.beginTxn(T);
+    once(T, '_k', () => T.txn && allVotedYes(T), () => { T.groups[0].W.nodes[0].state = 'down'; });
+  },
+  i => ({
+    ok: i.T._k && i.locked === i.shards && i.applied === 0,
+    text: `locked=${i.locked}/${i.shards}  applied=${i.applied}  (expected BLOCKED)`,
+  }));
+
+runTxn('2pc: replicated coord recovers', () => buildTxn(3, [3, 3]), 90000,
+  (T, t) => {
+    if (t === 2000) X.beginTxn(T);
+    once(T, '_k', () => T.txn && allVotedYes(T) && X.groupLeader(T.groups[0]),
+      () => { X.groupLeader(T.groups[0]).state = 'down'; });
+  },
+  i => ({
+    ok: i.T._k && i.applied === i.shards,
+    text: `${tally(i)}  (expected RECOVERY)`,
+  }));
+
+// A shard that cannot elect can never accept anything. 2PC does the only safe
+// thing left: presume abort, and release the shard that had already locked.
+runTxn('2pc: presumed abort on timeout', () => buildTxn(3, [3, 3]), 90000,
+  (T, t) => {
+    if (t === 2000) {
+      T.groups[2].W.nodes[0].state = 'down';
+      T.groups[2].W.nodes[1].state = 'down';
+      X.beginTxn(T);
+    }
+  },
+  i => ({
+    ok: X.coordFate(i.T).decision === 'abort' && X.shardFate(i.T, i.T.groups[1]).applied === 'abort',
+    text: `decision=${X.coordFate(i.T).decision}  shard A applied=${X.shardFate(i.T, i.T.groups[1]).applied}`,
+  }));
+
+// Safety only. Under this much damage a transaction may never finish, and that
+// is correct behaviour — the same stance the Raft chaos rows take.
+runTxn('2pc: atomicity under chaos', () => buildTxn(3, [3, 3, 3], { dropRate: 0.2, jitter: 0.3 }), 120000,
+  (T, t) => {
+    if (t % 20000 === 2000) X.beginTxn(T);
+    if (t % 3000 === 0) {
+      const g = T.groups[Math.floor(Math.random() * T.groups.length)];
+      const n = g.W.nodes[Math.floor(Math.random() * g.W.nodes.length)];
+      if (n.state === 'down') { n.state = 'follower'; n.lastHeard = 6000; }
+      else if (g.W.nodes.filter(x => x.state !== 'down').length > 2) n.state = 'down';
+    }
+    if (t % 5000 === 0) {
+      const b = 1 + Math.floor(Math.random() * (T.groups.length - 1));
+      const k = X.linkKey(0, b), next = X.LINK_CYCLE[T.links[k]];
+      if (next === undefined) delete T.links[k]; else T.links[k] = next;
+    }
+    if (t % 7000 === 0) {
+      const g = T.groups[1 + Math.floor(Math.random() * (T.groups.length - 1))];
+      g.partition = g.partition ? 0 : 1;
+    }
+  },
+  i => ({ ok: true, text: `phase=${i.phase}  safety only, liveness not asserted` }));
+
+/* Every preset, driven headlessly. No outcome is asserted — coordDies is
+   supposed to hang, and shardNoQuorum is supposed to abort — but all of them
+   must hold every invariant while they get there. */
+for (const key of Object.keys(X.TXN_SCENARIOS))
+  runTxn('2pc scenario: ' + key, () => X.TXN_SCENARIOS[key].build(txnCfg()), 60000, null,
+    i => ({ ok: true, text: tally(i) }));
 
 console.log('\n' + (failures ? `${failures} CHECK(S) FAILED` : 'ALL INVARIANTS HELD'));
 process.exit(failures ? 1 : 0);
