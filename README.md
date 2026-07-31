@@ -56,7 +56,7 @@ That third one is the interesting one. A one-way cut models a node that is fully
 
 ## The scenarios
 
-Seven presets, roughly in order of subtlety:
+Eight presets, roughly in order of subtlety:
 
 | Scenario | What it demonstrates |
 |---|---|
@@ -67,6 +67,9 @@ Seven presets, roughly in order of subtlety:
 | **One-way link** | A node that can send but never receive times out forever and repeatedly disrupts a healthy leader. **Turn on PreVote and watch it stop.** |
 | **Stale follower repair** | A follower holds four entries from a dead term-2 leader. Watch `nextIndex` walk backwards until the logs match, then the bad tail is truncated |
 | **Figure 8** | Every node stores an entry from an old term, replicated to all five — and the leader still refuses to commit it |
+| **Figure 8 — the overwrite** | The counterexample that motivates the rule. An old-term entry reaches a majority and is then destroyed anyway. **Run it once with Leader no-op off, then again with it on.** |
+
+The overwrite scenario answers the obvious objection — *surely a node with an old log could never win an election?* It can. N4 holds the only up-to-date log and is crashed, so it votes on nothing, while N2 and N3 hold **empty** logs and happily elect N0. Up-to-dateness is checked against the voters who answer, not against the whole cluster. X then reaches four of five nodes, is still not committed, and is overwritten the moment N4 comes back. Turn on Leader no-op and the same setup commits X instead — after which N4 can never win again.
 
 Figure 8 is the one worth sitting with. Raft only commits entries from the leader's **own** term; an old entry replicated to every single node still stays uncommitted. Press *Client command* and both commit at once. This rule is the difference between a correct Raft and a subtly broken one.
 

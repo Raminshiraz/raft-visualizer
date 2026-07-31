@@ -727,6 +727,65 @@ const SCENARIOS = {
       });
       return W;
     }
+  },
+  figure8Lost: {
+    label: 'Figure 8 — the overwrite',
+    note: 'Proof that "stored on a majority" is NOT enough. N0 holds X from term 2; N2 and N3 never received it; N4 alone holds Y from term 3 and is DOWN, so the one better log in the cluster votes on nothing. N0 wins term 4 against those empty logs, spreads X to four of five nodes — and still refuses to commit it. Then N0 crashes, N4 returns, and X is overwritten everywhere. Anyone who had called X committed just lost it. Now switch ON Leader no-op and load this again: X commits, and N4 can never win.',
+    build(cfg) {
+      // Paper Figure 8(b), frozen the instant S5 crashes. cfg.noop is passed
+      // through untouched — the whole point is to run this both ways.
+      const W = makeWorld(5, cfg);
+      for (const n of W.nodes) {
+        n.currentTerm = 3;
+        n.commitIndex = 0;
+        n.timeout = 5500;
+      }
+      W.nodes[0].log = [{
+        term: 2,
+        value: 'X'
+      }]; // X got to N0 and N1 and stopped
+      W.nodes[1].log = [{
+        term: 2,
+        value: 'X'
+      }];
+      W.nodes[4].log = [{
+        term: 3,
+        value: 'Y'
+      }]; // Y never left N4
+      W.nodes[4].state = 'down';
+      W.nodes[0].timeout = 80; // N0 campaigns first
+      W.nodes.forEach(n => {
+        n.timeoutInit = Math.max(n.timeout, ELECTION_MIN);
+      });
+
+      // The moment X reaches a majority, crash N0 and let N4 back in. N4 has
+      // to campaign twice: the others already spent their term-4 vote on N0,
+      // so its first bid is refused and only the term-5 bid can win.
+      W.armed = W => {
+        const L = W.nodes.find(n => n.state === 'leader' && n.id === 0);
+        if (!L) return false;
+        let on = 1;
+        for (const id in L.matchIndex) if (L.matchIndex[id] >= 1) on++;
+        if (on < quorum(nodeCount(W))) return false;
+        L.state = 'down';
+        emit(W, L.id, `CRASHED by scenario — X sits on ${on}/${nodeCount(W)} nodes and is STILL uncommitted`, 'crash');
+        for (const o of W.nodes) {
+          // keep the field clear for N4
+          if (o.id === 0 || o.id === 4) continue;
+          o.timeout = 11000;
+          o.timeoutInit = 11000;
+        }
+        const back = byId(W, 4);
+        back.state = 'follower';
+        back.leaderId = null;
+        back.lastHeard = ELECTION_MAX;
+        back.timeout = 300;
+        back.timeoutInit = ELECTION_MIN;
+        emit(W, back.id, `restarts holding Y from term 3 — the only node that ever saw it`, 'sys');
+        return true;
+      };
+      return W;
+    }
   }
 };
 
