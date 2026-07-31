@@ -426,6 +426,26 @@ runTxn('2pc: lone coordinator BLOCKS (ctl)', () => buildTxn(1, [3, 3]), 60000,
     text: `locked=${i.locked}/${i.shards}  applied=${i.applied}  (expected BLOCKED)`,
   }));
 
+/* A coordinator's vote tally is VOLATILE. Crashing the machine and starting it
+   again must lose it, even though the restarted process has the same node id --
+   only the log survives a crash. Without this the lone-coordinator demo lies:
+   it would decide from votes it could not possibly still remember. */
+runTxn('2pc: crashed coord forgets its tally', () => buildTxn(1, [3, 3]), 90000,
+  (T, t) => {
+    if (t === 2000) X.beginTxn(T);
+    once(T, '_k', () => T.txn && allVotedYes(T), () => { T.groups[0].W.nodes[0].state = 'down'; });
+    once(T, '_r', () => T._k && t > 20000, () => {
+      const n = T.groups[0].W.nodes[0];
+      n.state = 'follower'; n.votes = {}; n.preVotes = {}; n.preVoteTerm = 0;
+      n.phase = null; n.leaderId = null; n.lastHeard = 9000;
+    });
+    if (T._r && T.txn) T._empty = T._empty || Object.keys(T.txn.votes).length === 0;
+  },
+  i => ({
+    ok: i.T._r && i.T._empty === true,
+    text: `restarted=${!!i.T._r}  tally emptied on restart=${i.T._empty === true}`,
+  }));
+
 runTxn('2pc: replicated coord recovers', () => buildTxn(3, [3, 3]), 90000,
   (T, t) => {
     if (t === 2000) X.beginTxn(T);

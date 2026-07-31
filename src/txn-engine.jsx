@@ -55,7 +55,7 @@ function makeTxnWorld(coordSize, shardSizes, cfg){
     groups, msgs:[], events:[], cfg, links:{},
     txn:null, pending:[], txnSeq:0,
     clock:0, armed:null, note:null,
-    nextMid:0, nextEid:0, coordLeader:null,
+    nextMid:0, nextEid:0, coordLeader:null, coordGone:false,
   };
 }
 
@@ -288,10 +288,16 @@ function coordinatorStep(T){
   const t = T.txn; if(!t) return;
   const g0 = T.groups[0];
   const L = groupLeader(g0);
-  if(!L) return;   // no coordinator leader: 2PC simply stops. This IS the blocking window.
+  // No coordinator leader: 2PC simply stops. This IS the blocking window. Note
+  // that whatever tally we are holding belonged to a leader that is now gone —
+  // comparing ids alone would miss a crash-and-restart of the SAME node, which
+  // is exactly what "Coordinator dies — one machine" invites you to try. Its
+  // in-memory votes did not survive that; only its log did.
+  if(!L){ if(T.coordLeader !== null) T.coordGone = true; return; }
 
   // A new leader inherits the durable records but none of the tallies.
-  if(T.coordLeader !== L.id){
+  if(T.coordLeader !== L.id || T.coordGone){
+    T.coordGone = false;
     if(T.coordLeader !== null){
       t.votes = {}; t.acks = {};
       t.deadline  = T.clock + PREPARE_TIMEOUT;
@@ -333,14 +339,14 @@ function beginTxn(T){
   T.txn = { id:'T'+(++T.txnSeq), votes:{}, acks:{},
             deadline:T.clock+PREPARE_TIMEOUT, lastRetry:T.clock-TXN_RETRY, startedAt:T.clock };
   T.pending = [];
-  T.coordLeader = null;
+  T.coordLeader = null; T.coordGone = false;
   emitT(T, 0, `client begins ${T.txn.id} across ${shardsOf(T).length} shards`, 'sys');
   return true;
 }
 function resetTxn(T, why){
   if(!T.txn) return;
   emitT(T, 0, `${T.txn.id} discarded — ${why}`, 'sys');
-  T.txn = null; T.pending = []; T.msgs = []; T.coordLeader = null;
+  T.txn = null; T.pending = []; T.msgs = []; T.coordLeader = null; T.coordGone = false;
 }
 
 /* ------------------------------------------------------------------ *
