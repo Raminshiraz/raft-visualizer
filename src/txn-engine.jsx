@@ -258,6 +258,12 @@ function deliverTxn(T, m){
 
   if(m.type==='Prepare'){
     const C = committedOn(L, p.txn), A = anywhereOn(L, p.txn);
+    // Already applied the outcome: this Prepare is older than the decision that
+    // overtook it. Voting now would append a promise to a transaction that is
+    // over, and a shard that aborted without ever voting would end up holding a
+    // yes for it. Ack instead — that is the answer the coordinator wants.
+    if(C.applied){ sendTxn(T, g.id, 0, 'Ack', { txn:p.txn, dec:C.applied, index:C.at.applied }); return; }
+    if(A.applied) return;
     if(C.vote){
       emitT(T, g.id, `answers ${C.vote==='yes'?'PREPARED':'NO'} for ${p.txn} from its committed log (index ${C.at.vote}) — this leader may never have seen the original request`, 'prep');
       sendTxn(T, g.id, 0, 'Prepared', { txn:p.txn, vote:C.vote, index:C.at.vote });

@@ -38,7 +38,7 @@ let code = fs.readFileSync(path.join(here, '..', 'app.js'), 'utf8');
   }
 }
 code += '\n;globalThis.__X={makeWorld,tick,SCENARIOS,quorum,broadcastAppendEntries,linkKey,LINK_CYCLE,'
-      + 'makeTxnWorld,tickTxn,beginTxn,txnPhase,shardFate,coordFate,groupLeader,committedOn,TXN_SCENARIOS};';
+      + 'makeTxnWorld,tickTxn,beginTxn,txnPhase,shardFate,coordFate,groupLeader,committedOn,sendTxn,TXN_SCENARIOS};';
 
 // Minimal DOM/React stubs — we only exercise the simulation core.
 const sandbox = {
@@ -456,6 +456,48 @@ runTxn('2pc: replicated coord recovers', () => buildTxn(3, [3, 3]), 90000,
     ok: i.T._k && i.applied === i.shards,
     text: `${tally(i)}  (expected RECOVERY)`,
   }));
+
+/* A Prepare that loses its race with the decision it never got to influence.
+   SHARD B has no quorum, so it never votes; the coordinator presumes abort; B
+   comes back and applies the abort out of the Decide. A Prepare retry that was
+   still on the wire then arrives at a shard that has already finished.
+
+   Injected rather than waited for -- it did not occur once in 40 chaos runs at
+   45% loss, because a cut link kills an in-flight Prepare long before a Decide
+   can overtake it. Rare is not never, and the answer was YES: three replicas
+   left holding a prepared record for a transaction they had aborted, and
+   shardFate reporting vote='yes' on it forever after. */
+runTxn('2pc: stale Prepare after apply', () => {
+  const T = buildTxn(3, [3, 3]);
+  T.groups[2].W.nodes[0].state = 'down';    // SHARD B cannot elect, so it cannot vote
+  T.groups[2].W.nodes[1].state = 'down';
+  return T;
+}, 120000,
+  (T, t) => {
+    if (t === 2000) X.beginTxn(T);
+    once(T, '_r', () => X.coordFate(T).decision, () =>      // abort is durable; let B back in
+      T.groups[2].W.nodes.forEach(n => { if (n.state === 'down') { n.state = 'follower'; n.lastHeard = 9000; } }));
+    once(T, '_k', () => T._r && X.shardFate(T, T.groups[2], T.txn.id).applied, () => {
+      T._before = voteRecs(T.groups[2], T.txn.id);
+      X.sendTxn(T, 0, 2, 'Prepare', { txn: T.txn.id });
+    });
+  },
+  i => {
+    const after = voteRecs(i.T.groups[2], i.T.txn.id);
+    const fate = X.shardFate(i.T, i.T.groups[2], i.T.txn.id);
+    return {
+      ok: i.T._k && i.T._before === 0 && after === 0 && fate.vote === null && fate.applied === 'abort',
+      text: `SHARD B applied=${fate.applied} vote=${fate.vote}  vote records ${i.T._before} -> ${after}`,
+    };
+  });
+
+/** How many yes/no vote records the whole group holds for `id`, over all nodes. */
+function voteRecs(g, id) {
+  let k = 0;
+  for (const n of g.W.nodes)
+    for (const e of n.log) if (e.txn === id && (e.rec === 'prepared' || e.rec === 'novote')) k++;
+  return k;
+}
 
 // A shard that cannot elect can never accept anything. 2PC does the only safe
 // thing left: presume abort, and release the shard that had already locked.
