@@ -79,8 +79,13 @@ function Msgs({msgs,pos,onTip,s=1,look=msgLook,pay=payloadText,edge=null}){
       );
     }
     return (
+      /* `msg` is the identity the parent uses to notice the message is gone.
+         mouseleave covers the pointer moving away; it cannot cover the message
+         being delivered out from under a stationary pointer, because React
+         unmounts the <g> and an unmounted element fires nothing. */
       <g key={m.id} style={{cursor:'help'}}
-         onMouseEnter={e=>onTip({rows:pay(m),x:e.clientX,y:e.clientY})}>
+         onMouseEnter={e=>onTip({rows:pay(m),x:e.clientX,y:e.clientY,msg:m})}
+         onMouseLeave={()=>onTip(null)}>
         <line x1={p.x} y1={p.y} x2={x} y2={y} stroke={lk.c} strokeWidth="1.3"
           opacity="0.3" strokeDasharray="3 4"/>
         <circle cx={x} cy={y} r={13*s} fill={lk.c} opacity="0.15"/>
