@@ -279,6 +279,14 @@ function App(){
   const nLocks  = isTxn ? txnLocked(T).length : 0;
   const note    = isTxn ? T.note : W.note;
 
+  /* A message tooltip must not outlive its message. Compared by identity, not
+     by id: the ids are per world, so a group's message 7 and the cross-group
+     message 7 would keep each other's tooltips alive. Derived rather than
+     cleared through setTip, which would be a state write during render. */
+  const tipLive = !tip || !tip.msg || (isTxn
+    ? T.msgs.includes(tip.msg) || T.groups.some(g=>g.W.msgs.includes(tip.msg))
+    : W.msgs.includes(tip.msg));
+
   return (
     <div className="app">
       <div className="head">
@@ -535,7 +543,7 @@ function App(){
         </div>
       </div>
 
-      {tip && <Tip tip={tip}/>}
+      {tip && tipLive && <Tip tip={tip}/>}
     </div>
   );
 }
