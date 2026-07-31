@@ -32,11 +32,18 @@ function txnLayout(T){
       const a = -Math.PI/2 + j*2*Math.PI/k;
       pos[n.id] = { x: cx+gr*Math.cos(a), y: cy+gr*Math.sin(a) };
     });
-    out.groups.push({ g, cx, cy, nr, gr, r:gr+nr+7, s:nr/NODE_R, pos });
+    out.groups.push({ g, cx, cy, nr, gr, r:gr+nr+7, s:nr/NODE_R, pos, slot:shard?SLOT:VW });
     out.centres[g.id] = { x:cx, y:cy };
   }
   return out;
 }
+
+/* Rough advance width of the group label at 11px / weight 800 / letterSpacing 1.
+   Only ever used to decide whether the line has to wrap, and erring high is the
+   safe direction — it wraps a shade early rather than letting three shards'
+   labels run into one another. SVG has no wrapping and measuring properly means
+   getComputedTextLength, which needs the node to already be in the document. */
+const labelWidth = s => s.length * 7.4;
 
 /* The 2PC records in a group's log, newest `max`, read off its leader (or,
    if it has none, off whichever node knows the most). */
@@ -138,15 +145,24 @@ function TxnStage({T,onClick,mode,onTip,onLink,sel}){
         const fate  = g.role==='shard' ? shardFate(T,g) : null;
         const { recs } = txnRecords(g, 6);
         const sy = gl.cy + gl.r + 6;
+        /* Three shards leave 213px between centres, and "· NO LEADER" or the
+           lock alone pushes the label past that — the states most worth reading
+           were the ones that collided. Wrap onto a second line instead. */
+        const head = `${g.name}${fate&&fate.locked?' 🔒':''} · term ${term}`;
+        const tail = `${alive}/${g.W.nodes.length} up${Ld?'':' · NO LEADER'}`;
+        const wrap = labelWidth(`${head} · ${tail}`) > gl.slot-12;
+        const ly   = gl.cy - gl.r - 7;
         return (
           <g key={g.id}>
             <circle cx={gl.cx} cy={gl.cy} r={gl.r} fill={sel===g.id?'#111c40':'#0c1430'}
               opacity="0.6" stroke={col} strokeWidth={sel===g.id?2.2:1.2} strokeDasharray="7 6"/>
-            <text x={gl.cx} y={gl.cy-gl.r-7} textAnchor="middle" fontSize="11"
+            <text x={gl.cx} y={wrap?ly-12:ly} textAnchor="middle" fontSize="11"
               fontWeight="800" fill={col} letterSpacing="1">
-              {g.name}{fate&&fate.locked?' 🔒':''} · term {term} · {alive}/{g.W.nodes.length} up
-              {Ld?'':' · NO LEADER'}
+              {wrap ? head : `${head} · ${tail}`}
             </text>
+            {wrap &&
+              <text x={gl.cx} y={ly} textAnchor="middle" fontSize="11"
+                fontWeight="800" fill={col} letterSpacing="1">{tail}</text>}
 
             {/* Raft traffic inside the group, at the group's own scale */}
             <Msgs msgs={g.W.msgs} pos={gl.pos} onTip={onTip} s={gl.s}/>
