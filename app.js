@@ -45,9 +45,11 @@ function linkBlocks(W, from, to) {
  *  NODE MODEL                                                         *
  *  Mirrors Raft paper Figure 2 state exactly.                         *
  * ================================================================== */
-let _nid = 0,
-  _mid = 0,
-  _eid = 0;
+/* Node ids are allocated per world (W.nextNid), not globally, because the 2PC
+   view keeps several worlds alive at once — one Raft group each. Message and
+   event ids live on the world for the same reason: they are React keys, and
+   two worlds minting id 3 in the same frame is a duplicate-key bug. */
+let _nid = 0;
 function makeNode(term, id) {
   return {
     id: id === undefined ? _nid++ : id,
@@ -119,7 +121,7 @@ const byId = (W, id) => W.nodes.find(n => n.id === id);
 const nodeCount = W => W.nodes.length;
 function emit(W, nodeId, text, kind) {
   W.events.unshift({
-    id: _eid++,
+    id: W.nextEid++,
     t: (W.clock / 1000).toFixed(1),
     nodeId,
     text,
@@ -130,7 +132,7 @@ function emit(W, nodeId, text, kind) {
 function send(W, from, to, type, payload) {
   const jitter = W.cfg.jitter;
   W.msgs.push({
-    id: _mid++,
+    id: W.nextMid++,
     from,
     to,
     type,
@@ -191,6 +193,10 @@ function beginPreVote(W, n) {
       lastLogTerm: lastTerm(n)
     });
   }
+  // A candidate counts its own vote. For every N>1 this is already false here
+  // (1 >= quorum(2) is 2), so it only fires in a one-node group, where there
+  // is nobody to reply and the round would otherwise hang forever.
+  if (Object.keys(n.preVotes).length >= quorum(nodeCount(W))) startElection(W, n);
 }
 function startElection(W, n) {
   n.state = 'candidate';
@@ -214,6 +220,10 @@ function startElection(W, n) {
       lastLogTerm: lastTerm(n)
     });
   }
+  // Same reasoning as in beginPreVote: inert for N>1, and the only way a
+  // one-node group ever gets a leader. Without it an unreplicated coordinator
+  // could not run at all, and the whole 2PC blocking demo would be a fiction.
+  if (Object.keys(n.votes).length >= quorum(nodeCount(W))) becomeLeader(W, n);
 }
 function becomeLeader(W, n) {
   n.state = 'leader';
@@ -505,7 +515,9 @@ function blockReason(W, m) {
   return null;
 }
 function dieAt(reason) {
-  return reason === 'partitioned' ? 0.5 : reason === 'link cut' ? 0.5 : reason === 'target crashed' ? 0.9 : reason === 'sender crashed' ? 0.25 : 0.55;
+  return reason === 'partitioned' ? 0.5 : reason === 'link cut' ? 0.5 : reason === 'target crashed' ? 0.9
+  // 2PC only: dies at the far ring, so you see it arrive and find nobody home
+  : reason === 'no leader there' ? 0.9 : reason === 'sender lost leadership' ? 0.2 : reason === 'sender crashed' ? 0.25 : 0.55;
 }
 
 /* ------------------------------------------------------------------ *
@@ -564,8 +576,6 @@ function tick(W, dt) {
  * ================================================================== */
 function makeWorld(count, cfg) {
   _nid = 0;
-  _mid = 0;
-  _eid = 0;
   const nodes = [];
   for (let i = 0; i < count; i++) nodes.push(makeNode(0));
   nodes.forEach(n => {
@@ -580,8 +590,40 @@ function makeWorld(count, cfg) {
     cmdSeq: 0,
     armed: null,
     clock: 0,
-    note: null
+    note: null,
+    nextNid: count,
+    nextMid: 0,
+    nextEid: 0
   };
+}
+
+/* Membership, as world-level operations so the 2PC view can grow and shrink a
+   group without going through App's handlers. Ids come from W.nextNid, which
+   never rewinds — reusing an id would resurrect a dead node's matchIndex. */
+function addNodeTo(W, term) {
+  const n = makeNode(term, W.nextNid++);
+  n.timeoutInit = n.timeout;
+  n.lastHeard = 0;
+  W.nodes.push(n);
+  return n;
+}
+function removeNodeFrom(W) {
+  const n = W.nodes.pop();
+  if (!n) return null;
+  W.msgs = W.msgs.filter(m => m.from !== n.id && m.to !== n.id);
+  // Drop every trace of it, or a stale vote/matchIndex still counts toward
+  // a quorum that is now smaller than it was.
+  W.nodes.forEach(o => {
+    delete o.nextIndex[n.id];
+    delete o.matchIndex[n.id];
+    delete o.votes[n.id];
+    delete o.preVotes[n.id];
+  });
+  for (const k of Object.keys(W.links)) {
+    const [a, b] = k.split('-').map(Number);
+    if (a === n.id || b === n.id) delete W.links[k];
+  }
+  return n;
 }
 const SCENARIOS = {
   fresh: {
@@ -790,6 +832,644 @@ const SCENARIOS = {
 };
 
 /* ================================================================== *
+ *  FAULT-TOLERANT TWO-PHASE COMMIT                                    *
+ *                                                                     *
+ *  Plain 2PC has one famous flaw: the coordinator writes its decision  *
+ *  to one disk on one machine. Kill it between "collect the votes" and *
+ *  "announce the outcome" and every participant sits in PREPARED,      *
+ *  holding locks, forbidden to guess, forever.                        *
+ *                                                                     *
+ *  Gray & Lamport, "Consensus on Transaction Commit" (2006): make      *
+ *  every decision a consensus-replicated log record instead of one     *
+ *  node's write. That is what Spanner does — 2PC across Paxos groups.  *
+ *  Here it is 2PC across Raft groups, using the same engine above.     *
+ *                                                                     *
+ *  The rule this layer never breaks: nothing is said out loud until    *
+ *  it has been committed by the Raft group that says it. Every arrow   *
+ *  on the screen is preceded by a commit in the sending group.         *
+ * ================================================================== */
+/* The prepare deadline has to outlast a participant losing its leader and
+   electing a new one — which can cost a split vote, so budget two elections
+   (2*ELECTION_MAX) plus the round trips and the new leader's no-op. Tighter
+   than that and the coordinator presumes abort on faults the cluster would
+   have survived: a real 2PC tuning mistake, just not the one this view is
+   here to teach. */
+const PREPARE_TIMEOUT = 25000; // coordinator waits this long for votes, then presumes abort
+const TXN_RETRY = 2500; // re-send an unanswered Prepare / Decide
+const SHARD_NAMES = ['A', 'B', 'C'];
+
+/* ------------------------------------------------------------------ *
+ *  World                                                              *
+ * ------------------------------------------------------------------ */
+function makeGroup(id, role, size, cfg) {
+  const W = makeWorld(size, cfg);
+  return {
+    id,
+    role,
+    // 'coord' | 'shard'
+    name: role === 'coord' ? 'COORD' : 'SHARD ' + SHARD_NAMES[id - 1],
+    W,
+    // a full, live Raft world
+    partition: 0,
+    // cross-group network group
+    willVote: 'yes' // what this shard answers when asked
+  };
+}
+
+/* `id` and `partition` are named to match the node fields that Wire and
+   linkBlocks already read, so both work on group objects unchanged. */
+function makeTxnWorld(coordSize, shardSizes, cfg) {
+  const groups = [makeGroup(0, 'coord', coordSize, cfg)];
+  shardSizes.forEach((k, i) => groups.push(makeGroup(i + 1, 'shard', k, cfg)));
+  return {
+    groups,
+    msgs: [],
+    events: [],
+    cfg,
+    links: {},
+    txn: null,
+    pending: [],
+    txnSeq: 0,
+    clock: 0,
+    armed: null,
+    note: null,
+    nextMid: 0,
+    nextEid: 0,
+    coordLeader: null
+  };
+}
+function emitT(T, gid, text, kind) {
+  T.events.unshift({
+    id: T.nextEid++,
+    t: (T.clock / 1000).toFixed(1),
+    nodeId: gid,
+    text,
+    kind: kind || ''
+  });
+  if (T.events.length > 160) T.events.length = 160;
+}
+const groupLeader = g => g.W.nodes.find(n => n.state === 'leader');
+const shardsOf = T => T.groups.filter(g => g.role === 'shard');
+
+/* ------------------------------------------------------------------ *
+ *  Durable state lives in the logs — nothing about the transaction is  *
+ *  stored anywhere else. That is what makes coordinator recovery fall  *
+ *  out for free instead of needing a recovery path of its own.         *
+ * ------------------------------------------------------------------ */
+function scanLog(n, txnId, upTo) {
+  const r = {
+    begin: false,
+    decision: null,
+    vote: null,
+    applied: null,
+    at: {}
+  };
+  const top = Math.min(upTo, n.log.length);
+  for (let i = 1; i <= top; i++) {
+    const e = n.log[i - 1];
+    if (!e || e.txn !== txnId) continue;
+    if (e.rec === 'begin') {
+      r.begin = true;
+      r.at.begin = i;
+    } else if (e.rec === 'decision') {
+      r.decision = e.dec;
+      r.at.decision = i;
+    } else if (e.rec === 'prepared') {
+      r.vote = 'yes';
+      r.at.vote = i;
+    } else if (e.rec === 'novote') {
+      r.vote = 'no';
+      r.at.vote = i;
+    } else if (e.rec === 'applied') {
+      r.applied = e.dec;
+      r.at.applied = i;
+    }
+  }
+  return r;
+}
+/* committedOn gates ACTIONS: only a committed fact may be acted on.
+   anywhereOn gates the DEDUPE GUARD: a leader must never append a second
+   decision while it already holds an uncommitted one, or a crash could
+   commit both abort@4 and commit@9. Sound because in Raft only entries in
+   the current leader's log can ever commit. */
+const committedOn = (n, id) => scanLog(n, id, n.commitIndex);
+const anywhereOn = (n, id) => scanLog(n, id, n.log.length);
+
+/* What a GROUP durably knows, as opposed to what its leader can currently
+   say. Scans every node on purpose: a vote that survives on the followers
+   after the leader dies is still durable, and that distinction is the whole
+   point of the exercise. Only the leader is ever allowed to answer, though. */
+function shardFate(T, g, txnId) {
+  const id = txnId || T.txn && T.txn.id;
+  let vote = null,
+    applied = null;
+  if (id) for (const n of g.W.nodes) {
+    const r = committedOn(n, id);
+    if (r.vote && !vote) vote = r.vote;
+    if (r.applied && !applied) applied = r.applied;
+  }
+  return {
+    vote,
+    applied,
+    locked: vote === 'yes' && applied === null
+  };
+}
+function coordFate(T, txnId) {
+  const id = txnId || T.txn && T.txn.id;
+  let begin = false,
+    decision = null;
+  if (id) for (const n of T.groups[0].W.nodes) {
+    const r = committedOn(n, id);
+    if (r.begin) begin = true;
+    if (r.decision && !decision) decision = r.decision;
+  }
+  return {
+    begin,
+    decision
+  };
+}
+function txnPhase(T) {
+  if (!T.txn) return 'idle';
+  const c = coordFate(T);
+  if (!c.begin) return 'beginning';
+  if (!c.decision) return 'preparing';
+  const done = shardsOf(T).every(g => shardFate(T, g).applied);
+  if (c.decision === 'commit') return done ? 'committed' : 'committing';
+  return done ? 'aborted' : 'aborting';
+}
+const txnDone = T => {
+  const p = txnPhase(T);
+  return p === 'committed' || p === 'aborted' || p === 'idle';
+};
+const txnLocked = T => shardsOf(T).filter(g => shardFate(T, g).locked);
+
+/* ------------------------------------------------------------------ *
+ *  Raft <-> 2PC coupling: append, then wait for the commit, then act.  *
+ *                                                                     *
+ *  advanceCommit only runs inside deliver()'s AppendEntriesReply       *
+ *  branch and there is no hook there. Rather than teach the Raft       *
+ *  engine about transactions, park a continuation and poll it.         *
+ * ------------------------------------------------------------------ */
+function raftAppend(T, g, entry, kind) {
+  const L = groupLeader(g);
+  if (!L) return false; // caller retries later
+  L.log.push({
+    term: L.currentTerm,
+    ...entry
+  });
+  const index = lastIndex(L);
+  emit(g.W, L.id, `2PC ${entry.rec.toUpperCase()} for ${entry.txn} at index ${index} — not durable until a majority has it`, 'log');
+  broadcastAppendEntries(g.W, L);
+  L.hbTimer = HEARTBEAT;
+  advanceCommit(g.W, L); // a one-node group has no follower to reply for it
+  T.pending.push({
+    gid: g.id,
+    index,
+    term: L.currentTerm,
+    kind,
+    txn: entry.txn,
+    dec: entry.dec,
+    done: false
+  });
+  return true;
+}
+function pumpPending(T) {
+  for (const p of T.pending) {
+    const g = T.groups[p.gid];
+    if (!g) {
+      p.done = true;
+      continue;
+    } // group removed under us
+    const L = groupLeader(g);
+    if (!L) continue; // mid-election: just wait
+    if (L.commitIndex >= p.index && termAt(L, p.index) === p.term) {
+      p.done = true;
+      onCommitted(T, g, p);
+    } else if (L.currentTerm > p.term && termAt(L, p.index) !== p.term) {
+      // While the term has not moved, the same leader still holds it (Log
+      // Matching). Once it has, the entry is lost iff the current leader does
+      // not hold it here. Nothing is re-appended: the driving step notices the
+      // record is missing on its next retry and writes it again.
+      p.done = true;
+      emitT(T, g.id, `the ${p.kind} record for ${p.txn} was truncated by the new leader of term ${L.currentTerm} — it never committed`, 'block');
+    }
+  }
+  if (T.pending.some(p => p.done)) T.pending = T.pending.filter(p => !p.done);
+}
+function onCommitted(T, g, p) {
+  if (p.kind === 'begin') {
+    emitT(T, 0, `BEGIN ${p.txn} is durable on a majority of COORD — only now does PREPARE go out`, 'prep');
+    // The clock on the participants starts when they are actually asked, not
+    // when the client said "begin" — making BEGIN durable can itself take a
+    // coordinator election, and that time is not the shards' fault.
+    if (T.txn) T.txn.deadline = T.clock + PREPARE_TIMEOUT;
+    sendPrepares(T);
+  } else if (p.kind === 'vote') {
+    emitT(T, g.id, `its ${p.dec === 'yes' ? 'YES' : 'NO'} for ${p.txn} is durable at index ${p.index} — answering the coordinator`, p.dec === 'yes' ? 'prep' : 'block');
+    sendTxn(T, g.id, 0, 'Prepared', {
+      txn: p.txn,
+      vote: p.dec,
+      index: p.index
+    });
+  } else if (p.kind === 'decision') {
+    emitT(T, 0, `decision ${p.dec.toUpperCase()} for ${p.txn} is DURABLE at index ${p.index} — losing the coordinator can no longer lose it`, 'decide');
+    sendDecides(T);
+  } else if (p.kind === 'applied') {
+    emitT(T, g.id, `applied ${p.dec.toUpperCase()} for ${p.txn} — locks released`, 'decide');
+    sendTxn(T, g.id, 0, 'Ack', {
+      txn: p.txn,
+      dec: p.dec,
+      index: p.index
+    });
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  Cross-group transport — leader to leader, over T.msgs.             *
+ *  A parallel of send() rather than a generalisation of it: send has   *
+ *  eight call sites inside the Raft engine and its shape is what the   *
+ *  safety suite drives.                                               *
+ * ------------------------------------------------------------------ */
+function sendTxn(T, from, to, type, payload) {
+  const j = T.cfg.jitter;
+  const a = T.groups[from],
+    b = T.groups[to];
+  const la = a && groupLeader(a),
+    lb = b && groupLeader(b);
+  T.msgs.push({
+    id: T.nextMid++,
+    from,
+    to,
+    type,
+    payload,
+    fromNode: la ? la.id : null,
+    // captured for the tooltip only; never geometry
+    toNode: lb ? lb.id : null,
+    progress: 0,
+    travel: TRAVEL * rand(1 - j, 1 + j),
+    willDrop: Math.random() < T.cfg.dropRate,
+    dead: false,
+    fade: 0,
+    delivered: false
+  });
+}
+function txnBlockReason(T, m) {
+  const a = T.groups[m.from],
+    b = T.groups[m.to];
+  if (!a || !b) return 'group gone';
+  if (a.partition !== b.partition) return 'partitioned';
+  if (linkBlocks(T, m.from, m.to)) return 'link cut';
+  if (!groupLeader(a)) return 'sender lost leadership';
+  if (!groupLeader(b)) return 'no leader there';
+  if (m.willDrop) return 'packet lost';
+  return null;
+}
+function sendPrepares(T) {
+  const t = T.txn;
+  if (!t) return;
+  for (const g of shardsOf(T)) if (!t.votes[g.id]) sendTxn(T, 0, g.id, 'Prepare', {
+    txn: t.id
+  });
+  t.lastRetry = T.clock;
+}
+function sendDecides(T) {
+  const t = T.txn;
+  if (!t) return;
+  const dec = coordFate(T).decision;
+  if (!dec) return;
+  for (const g of shardsOf(T)) if (!t.acks[g.id]) sendTxn(T, 0, g.id, 'Decide', {
+    txn: t.id,
+    dec
+  });
+  t.lastRetry = T.clock;
+}
+
+/* The destination leader is resolved HERE, at delivery, never at send time —
+   which is what lets a brand-new leader answer for a transaction it has
+   never heard of, straight out of the log its predecessor replicated. */
+function deliverTxn(T, m) {
+  const g = T.groups[m.to];
+  if (!g) return;
+  const L = groupLeader(g);
+  if (!L) return;
+  const p = m.payload;
+  if (!T.txn || T.txn.id !== p.txn) return; // stale transaction
+
+  if (m.type === 'Prepare') {
+    const C = committedOn(L, p.txn),
+      A = anywhereOn(L, p.txn);
+    if (C.vote) {
+      emitT(T, g.id, `answers ${C.vote === 'yes' ? 'PREPARED' : 'NO'} for ${p.txn} from its committed log (index ${C.at.vote}) — this leader may never have seen the original request`, 'prep');
+      sendTxn(T, g.id, 0, 'Prepared', {
+        txn: p.txn,
+        vote: C.vote,
+        index: C.at.vote
+      });
+    } else if (A.vote) {
+      // Written but not committed. Saying it out loud would be a promise the
+      // group cannot keep if this leader dies before the entry commits.
+      emit(g.W, L.id, `holds an uncommitted ${p.txn} vote at index ${A.at.vote} from term ${termAt(L, A.at.vote)} — it cannot answer until that commits`, 'retry');
+    } else {
+      const yes = g.willVote !== 'no';
+      emitT(T, g.id, `votes ${yes ? 'YES' : 'NO'} on ${p.txn} — into its own Raft log first, so the promise outlives this node`, yes ? 'prep' : 'block');
+      raftAppend(T, g, {
+        value: yes ? 'Y' : 'N',
+        txn: p.txn,
+        rec: yes ? 'prepared' : 'novote',
+        dec: yes ? 'yes' : 'no'
+      }, 'vote');
+    }
+    return;
+  }
+  if (m.type === 'Prepared') {
+    T.txn.votes[m.from] = p.vote;
+    const got = Object.keys(T.txn.votes).length;
+    emitT(T, 0, `records ${T.groups[m.from].name} voted ${p.vote.toUpperCase()} (${got}/${shardsOf(T).length} in)`, p.vote === 'yes' ? 'prep' : 'block');
+    return;
+  }
+  if (m.type === 'Decide') {
+    const C = committedOn(L, p.txn),
+      A = anywhereOn(L, p.txn);
+    if (C.applied) {
+      sendTxn(T, g.id, 0, 'Ack', {
+        txn: p.txn,
+        dec: C.applied,
+        index: C.at.applied
+      });
+      return;
+    }
+    if (A.applied) return; // in flight — do not double-apply
+    emitT(T, g.id, `learns the decision is ${p.dec.toUpperCase()} — records it before releasing anything`, 'decide');
+    raftAppend(T, g, {
+      value: p.dec === 'commit' ? '✔' : '✘',
+      txn: p.txn,
+      rec: 'applied',
+      dec: p.dec
+    }, 'applied');
+    return;
+  }
+  if (m.type === 'Ack') {
+    T.txn.acks[m.from] = p.dec;
+    return;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  The coordinator, driven entirely by what its log says.             *
+ * ------------------------------------------------------------------ */
+function coordinatorStep(T) {
+  const t = T.txn;
+  if (!t) return;
+  const g0 = T.groups[0];
+  const L = groupLeader(g0);
+  if (!L) return; // no coordinator leader: 2PC simply stops. This IS the blocking window.
+
+  // A new leader inherits the durable records but none of the tallies.
+  if (T.coordLeader !== L.id) {
+    if (T.coordLeader !== null) {
+      t.votes = {};
+      t.acks = {};
+      t.deadline = T.clock + PREPARE_TIMEOUT;
+      t.lastRetry = T.clock - TXN_RETRY;
+      emitT(T, 0, `COORD leader is now N${L.id} — the in-memory vote tally died with the old one, the durable records did not`, 'block');
+    }
+    T.coordLeader = L.id;
+  }
+  const C = committedOn(L, t.id),
+    A = anywhereOn(L, t.id);
+  if (!A.begin) {
+    raftAppend(T, g0, {
+      value: 'B',
+      txn: t.id,
+      rec: 'begin'
+    }, 'begin');
+    return;
+  }
+  if (!C.begin) return; // BEGIN not durable yet — nobody is asked anything
+
+  const shards = shardsOf(T);
+  if (C.decision === null) {
+    if (A.decision !== null) return; // a decision is written and settling; never append a second
+    const votes = shards.map(g => t.votes[g.id]);
+    if (votes.some(v => v === 'no')) {
+      emitT(T, 0, `a shard refused — recording ABORT`, 'block');
+      raftAppend(T, g0, {
+        value: '✘',
+        txn: t.id,
+        rec: 'decision',
+        dec: 'abort'
+      }, 'decision');
+    } else if (shards.length && votes.every(v => v === 'yes')) {
+      emitT(T, 0, `every shard voted YES — recording COMMIT`, 'decide');
+      raftAppend(T, g0, {
+        value: '✔',
+        txn: t.id,
+        rec: 'decision',
+        dec: 'commit'
+      }, 'decision');
+    } else if (T.clock > t.deadline) {
+      emitT(T, 0, `prepare deadline expired with ${votes.filter(Boolean).length}/${shards.length} votes in — PRESUMED ABORT. It is not allowed to wait, and it is not allowed to guess yes`, 'block');
+      raftAppend(T, g0, {
+        value: '✘',
+        txn: t.id,
+        rec: 'decision',
+        dec: 'abort'
+      }, 'decision');
+    } else if (T.clock - t.lastRetry > TXN_RETRY) sendPrepares(T);
+    return;
+  }
+  if (shards.every(g => t.acks[g.id])) return; // terminal
+  if (T.clock - t.lastRetry > TXN_RETRY) sendDecides(T);
+}
+function beginTxn(T) {
+  if (T.txn && !txnDone(T)) {
+    emitT(T, 0, `${T.txn.id} is still running — let it finish first`, 'block');
+    return false;
+  }
+  T.txn = {
+    id: 'T' + ++T.txnSeq,
+    votes: {},
+    acks: {},
+    deadline: T.clock + PREPARE_TIMEOUT,
+    lastRetry: T.clock - TXN_RETRY,
+    startedAt: T.clock
+  };
+  T.pending = [];
+  T.coordLeader = null;
+  emitT(T, 0, `client begins ${T.txn.id} across ${shardsOf(T).length} shards`, 'sys');
+  return true;
+}
+function resetTxn(T, why) {
+  if (!T.txn) return;
+  emitT(T, 0, `${T.txn.id} discarded — ${why}`, 'sys');
+  T.txn = null;
+  T.pending = [];
+  T.msgs = [];
+  T.coordLeader = null;
+}
+
+/* ------------------------------------------------------------------ *
+ *  One 2PC tick: every group's Raft, then the cross-group wire, then   *
+ *  the commit continuations, then the coordinator.                     *
+ * ------------------------------------------------------------------ */
+function tickTxn(T, dt) {
+  T.clock += dt;
+  for (const g of T.groups) {
+    tick(g.W, dt);
+    const L = groupLeader(g);
+    if (L && g.W.nodes.length === 1) advanceCommit(g.W, L); // nobody will ever reply to it
+  }
+  for (const m of T.msgs) {
+    if (m.dead) {
+      m.fade += dt;
+      continue;
+    }
+    const reason = txnBlockReason(T, m);
+    if (reason && m.progress >= dieAt(reason)) {
+      m.dead = true;
+      m.fade = 0;
+      m.reason = reason;
+      continue;
+    }
+    m.progress += dt / m.travel;
+    if (m.progress >= 1) {
+      if (!reason) deliverTxn(T, m);
+      m.delivered = true;
+    }
+  }
+  T.msgs = T.msgs.filter(m => !m.delivered && !(m.dead && m.fade > 450));
+  pumpPending(T);
+  coordinatorStep(T);
+  if (T.armed) {
+    if (T.armed(T)) T.armed = null;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ *  2PC scenarios                                                       *
+ *                                                                      *
+ *  Kept in their own object rather than in SCENARIOS, because the       *
+ *  safety suite iterates SCENARIOS expecting every entry to build a     *
+ *  single Raft world. These build a transaction world instead.          *
+ * ------------------------------------------------------------------ */
+
+/* A scripted scenario is a list of [predicate, action] stages, run in
+   order, one at a time, polled from tickTxn exactly like W.armed. */
+function script(stages) {
+  let i = 0;
+  return T => {
+    while (i < stages.length) {
+      const [when, act] = stages[i];
+      if (!when(T)) return false;
+      act(T);
+      i++;
+    }
+    return true;
+  };
+}
+const hasCoordLeader = T => !!groupLeader(T.groups[0]);
+const votedYes = gid => T => shardFate(T, T.groups[gid]).vote === 'yes';
+const allVoted = T => shardsOf(T).every(g => shardFate(T, g).vote);
+const asked = gid => T => T.msgs.some(m => m.type === 'Prepare' && m.to === gid);
+const crashLeaderOf = g => {
+  const L = groupLeader(g);
+  if (L) L.state = 'down';
+  return L;
+};
+const TXN_SCENARIOS = {
+  happy: {
+    label: 'Commit path',
+    note: 'Nothing broken. Watch the ORDER, because it is the whole difference between this and textbook 2PC: the coordinator appends BEGIN and waits for a majority of its own group before a single PREPARE leaves the building, and each shard appends its YES and waits for its own majority before answering. Every arrow you see is preceded by a commit.',
+    build(cfg) {
+      const T = makeTxnWorld(3, [3, 3], cfg);
+      T.armed = script([[hasCoordLeader, T => beginTxn(T)]]);
+      return T;
+    }
+  },
+  voteNo: {
+    label: 'A shard votes NO',
+    note: 'Shard B is set to answer NO. Its refusal is Raft-appended and committed exactly like a yes would be — a NO is a promise too, and a coordinator that crashes must be able to re-read it. One refusal is enough: the coordinator records ABORT, and Shard A, which had already voted yes and taken locks, releases them.',
+    build(cfg) {
+      const T = makeTxnWorld(3, [3, 3], cfg);
+      T.groups[2].willVote = 'no';
+      T.armed = script([[hasCoordLeader, T => beginTxn(T)]]);
+      return T;
+    }
+  },
+  shardLeaderDies: {
+    label: 'Shard leader dies after PREPARED',
+    note: 'Shard A\'s leader is crashed the instant its YES becomes durable. It was the only node that ever spoke to the coordinator, and it is gone. Watch the survivors elect a replacement, and watch that replacement answer PREPARED for a transaction it has never heard of, straight out of the replicated log. This is the entire reason to put a participant behind Raft. Now turn OFF Leader no-op and load it again: the new leader holds the vote but cannot commit an entry from the old term, so it goes quiet and the transaction times out into an abort. Figure 8, with a transaction riding on it.',
+    build(cfg) {
+      const T = makeTxnWorld(3, [3, 3], cfg);
+      T.armed = script([[hasCoordLeader, T => beginTxn(T)], [votedYes(1), T => {
+        const L = crashLeaderOf(T.groups[1]);
+        if (L) emitT(T, 1, `leader N${L.id} CRASHED by scenario — it is the only node that has spoken to the coordinator`, 'block');
+      }]]);
+      return T;
+    }
+  },
+  coordDies: {
+    label: 'Coordinator dies — one machine',
+    note: 'The coordinator is a single machine, the way textbook 2PC draws it. It crashes after both shards have voted yes and before it records a decision. Both shards are now PREPARED, both hold locks, and neither is allowed to guess — a yes vote is a promise to be able to commit, not permission to. Nothing times out. Nothing recovers. This is the blocking problem, and no amount of retrying fixes it. Now switch ON Replicated coordinator and load this again.',
+    build(cfg) {
+      const T = makeTxnWorld(1, [3, 3], cfg);
+      T.armed = script([[hasCoordLeader, T => beginTxn(T)], [allVoted, T => {
+        T.groups[0].W.nodes[0].state = 'down';
+        emitT(T, 0, `the coordinator CRASHED holding both votes and no decision — there is no second copy`, 'block');
+      }]]);
+      return T;
+    }
+  },
+  coordDiesFT: {
+    label: 'Coordinator dies — replicated',
+    note: 'The same script, except the coordinator is a three-node Raft group and the crash takes only its leader. The survivors elect a new one. The in-memory vote tally is gone with the old leader — watch it re-send PREPARE and collect the votes again — but the BEGIN record is still on a majority, and the shards answer from their own committed logs. The transaction finishes. The machine that started it never came back.',
+    build(cfg) {
+      const T = makeTxnWorld(3, [3, 3], cfg);
+      T.armed = script([[hasCoordLeader, T => beginTxn(T)], [allVoted, T => {
+        const L = crashLeaderOf(T.groups[0]);
+        if (L) emitT(T, 0, `COORD leader N${L.id} CRASHED holding both votes and no decision — but it was never the only copy`, 'block');
+      }]]);
+      return T;
+    }
+  },
+  cutShard: {
+    label: 'Coordinator cut off from a shard',
+    note: 'The wire between the coordinator and Shard B is cut while PREPARE is still in flight. Shard A votes yes and locks. Shard B\'s answer dies in mid-air. The coordinator cannot tell a dead shard from a slow one and is not allowed to care: when the prepare deadline runs out it records ABORT, and A releases. Press Heal network afterwards and watch B learn the decision late.',
+    build(cfg) {
+      const T = makeTxnWorld(3, [3, 3], cfg);
+      T.armed = script([[hasCoordLeader, T => beginTxn(T)], [asked(2), T => {
+        T.links[linkKey(0, 2)] = 'cut';
+        emitT(T, 0, `the wire to SHARD B is CUT — its answer, whatever it was, is not coming`, 'block');
+      }]]);
+      return T;
+    }
+  },
+  shardNoQuorum: {
+    label: 'Shard loses quorum',
+    note: 'Two of Shard B\'s three nodes are already down, so it can never elect a leader and can never append anything. PREPARE arrives at a group with nobody home and dies on the ring. Raft is behaving correctly here — it stops rather than risk split brain — and 2PC on top of it does the only safe thing left: presumed abort. Restart a node in Shard B before the deadline and the transaction lives.',
+    build(cfg) {
+      const T = makeTxnWorld(3, [3, 3], cfg);
+      T.groups[2].W.nodes[0].state = 'down';
+      T.groups[2].W.nodes[1].state = 'down';
+      T.armed = script([[hasCoordLeader, T => beginTxn(T)]]);
+      return T;
+    }
+  },
+  slowShard: {
+    label: 'Prepare timeout — presumed abort',
+    note: 'Nothing is crashed and nothing is cut. Every group is just sitting behind 45% packet loss. The votes may or may not arrive before the deadline — run it a few times. The outcome is indistinguishable from the crash and from the partition, which is exactly the point: presumed abort does not care why the answer was late, because it cannot find out.',
+    build(cfg) {
+      const T = makeTxnWorld(3, [3, 3], {
+        ...cfg,
+        dropRate: 0.45
+      });
+      T.armed = script([[hasCoordLeader, T => beginTxn(T)]]);
+      return T;
+    }
+  }
+};
+
+/* ================================================================== *
  *  LAYOUT — nodes arc-grouped by network partition                    *
  * ================================================================== */
 function computeLayout(nodes, W, H) {
@@ -951,6 +1631,114 @@ function explain(W) {
     why: 'Different deadlines mean one node almost always moves first, which keeps elections short.'
   };
 }
+
+/* Same shape and same priority-cascade style as explain(), so the panel
+   markup is shared. Everything interpolated is an internal constant or a
+   number — nothing user-supplied reaches the HTML. */
+function explainTxn(T) {
+  const t = T.txn;
+  const g0 = T.groups[0];
+  const cl = groupLeader(g0);
+  const shards = shardsOf(T);
+  const locked = txnLocked(T);
+  const phase = txnPhase(T);
+  const secs = ms => (Math.max(0, ms) / 1000).toFixed(1) + 's';
+  if (!cl && locked.length) {
+    const solo = g0.W.nodes.length === 1;
+    return {
+      ttl: `BLOCKED — ${locked.length} shard${locked.length > 1 ? 's hold' : ' holds'} locks and nobody can decide`,
+      tone: 'var(--down)',
+      bd: `${locked.map(g => g.name).join(' and ')} ${locked.length > 1 ? 'have' : 'has'} voted yes and taken locks. The coordinator group has no leader, so no decision can be recorded and none can be announced. ${solo ? 'It is a <em>single machine</em>, so there is no second copy of anything.' : `Its ${g0.W.nodes.length} nodes cannot reach a quorum.`} The shards are not allowed to guess: a yes vote is a promise that they <em>can</em> commit, never permission to.`,
+      why: 'This is 2PC\'s famous blocking window. The participants have promised, and only the coordinator may release them. Put the coordinator behind Raft — add nodes to it — and the promise outlives the machine that took it.'
+    };
+  }
+  if (!cl) return {
+    ttl: 'COORD has no leader — 2PC is paused',
+    tone: 'var(--candidate)',
+    bd: `The coordinator group is electing. Nothing is lost — no shard has promised anything yet — but no transaction can make progress until it has a leader again.`,
+    why: 'The coordinator is only a Raft group like any other: it stops rather than risk two coordinators deciding differently.'
+  };
+  const electing = shards.find(g => !groupLeader(g));
+  if (electing && t) return {
+    ttl: `${electing.name} has no leader — 2PC just waits`,
+    tone: 'var(--candidate)',
+    bd: `The coordinator cannot get an answer out of ${electing.name} until that group elects someone. It will keep retrying until its prepare deadline runs out, then presume abort.`,
+    why: 'A shard that cannot elect cannot accept anything either. Stopping is the correct behaviour; it is the coordinator\'s job to give up in bounded time.'
+  };
+  if (t) {
+    const stranded = shards.find(g => {
+      const L = groupLeader(g);
+      if (!L) return false;
+      const A = anywhereOn(L, t.id),
+        C = committedOn(L, t.id);
+      return A.vote && !C.vote;
+    });
+    if (stranded) return {
+      ttl: `${stranded.name}'s vote is stranded in an older term`,
+      tone: 'var(--candidate)',
+      bd: `Its new leader holds the vote record but cannot commit it: Raft only commits entries from the leader's <em>own</em> term. Until something from the current term commits, that vote is invisible and the shard stays silent.`,
+      why: 'This is Figure 8 with a transaction riding on it. Turn on Leader no-op and the new leader appends one immediately, which carries the old vote over with it.'
+    };
+    const unreachable = shards.find(g => g.partition !== g0.partition || linkBlocks(T, 0, g.id));
+    if (unreachable && phase === 'preparing') return {
+      ttl: `COORD cannot reach ${unreachable.name}`,
+      tone: 'var(--down)',
+      bd: `Messages to ${unreachable.name} are dying on the wire. The coordinator cannot tell a dead shard from a slow one, and it is not allowed to care — it presumes abort in ${secs(t.deadline - T.clock)}.`,
+      why: 'Uncertainty and failure are the same thing to a coordinator on a deadline. That is why the safe default is abort, not commit.'
+    };
+    const no = shards.find(g => shardFate(T, g).vote === 'no');
+    if (no && phase === 'preparing') return {
+      ttl: `${no.name} voted NO — the whole transaction must abort`,
+      tone: 'var(--down)',
+      bd: `One refusal is enough. The coordinator is recording ABORT, and every shard that already locked will release as soon as it hears.`,
+      why: 'A NO is Raft-committed exactly like a YES. It is a promise too, and a coordinator that crashes has to be able to re-read it.'
+    };
+    if (phase === 'beginning') return {
+      ttl: 'Waiting for Raft to commit the BEGIN record',
+      tone: 'var(--follower)',
+      bd: `The coordinator has appended BEGIN ${t.id} to its own log and is waiting for a majority of its group to store it. <em>No PREPARE goes out until it does.</em>`,
+      why: 'If it asked first and recorded second, a crash in between would leave shards holding locks for a transaction no coordinator has ever heard of.'
+    };
+    if (phase === 'preparing') {
+      const got = Object.keys(t.votes).length;
+      return {
+        ttl: `Phase 1 — collecting votes (${got}/${shards.length})`,
+        tone: 'var(--pv)',
+        bd: `Each shard appends its own vote to its own Raft log and waits for its own majority before answering. Presumed abort in <em>${secs(t.deadline - T.clock)}</em>.`,
+        why: 'That is what makes a vote survivable: the promise is stored by the group, not by the one node that happened to be leader when it was made.'
+      };
+    }
+    if (phase === 'committing' || phase === 'aborting') {
+      const dec = phase === 'committing' ? 'COMMIT' : 'ABORT';
+      const acks = Object.keys(t.acks).length;
+      return {
+        ttl: `Decision ${dec} is durable — telling the shards (${acks}/${shards.length})`,
+        tone: phase === 'committing' ? 'var(--leader)' : 'var(--down)',
+        bd: `The decision is on a majority of the coordinator group. From here it cannot be lost, only re-sent: crash the leader and the next one reads it out of the log and carries on.`,
+        why: 'This is the line plain 2PC cannot draw. One machine\'s disk write became a committed consensus record, and that is the whole fix.'
+      };
+    }
+    if (phase === 'committed') return {
+      ttl: `${t.id} committed on every shard`,
+      tone: 'var(--leader)',
+      bd: `Every shard recorded the outcome in its own log and released its locks. The decision, the votes and the outcome all survive any single machine.`,
+      why: 'Press Begin transaction to run another, or break something first and see how far it gets.'
+    };
+    if (phase === 'aborted') return {
+      ttl: `${t.id} aborted everywhere — no shard applied it`,
+      tone: 'var(--down)',
+      bd: `Every shard recorded ABORT and released. Nothing was half-applied anywhere, which is the only promise 2PC actually makes.`,
+      why: 'Abort is not a failure of the protocol. Reaching the same answer everywhere is the success condition.'
+    };
+  }
+  return {
+    ttl: 'No transaction — press Begin transaction',
+    tone: 'var(--follower)',
+    bd: `Each bubble is a full Raft group with its own leader, term and log. The coordinator is on top; the shards below it are the participants. Crash nodes, cut the wires between groups, or resize any group first — then start a transaction and watch what it costs.`,
+    why: 'Every 2PC record here is an ordinary Raft log entry. That is the entire idea: replace the coordinator\'s single disk write with a committed consensus record.'
+  };
+}
+
 /* ================================================================== *
  *  APP                                                                *
  * ================================================================== */
@@ -965,6 +1753,15 @@ function App() {
   if (world.current === null) world.current = SCENARIOS.fresh.build({
     ...DEFAULT_CFG
   });
+
+  /* The 2PC world is a peer of the Raft world, not a child of it: several
+     live Raft groups plus the transaction driving them. Built lazily so the
+     Raft view costs nothing extra until you switch. */
+  const txnWorld = useRef(null);
+  if (txnWorld.current === null) txnWorld.current = makeTxnWorld(3, [3, 3], {
+    ...DEFAULT_CFG,
+    noop: true
+  });
   const ui = useRef({
     running: true,
     speed: 1
@@ -977,9 +1774,13 @@ function App() {
   });
   const [scenario, setScenario] = useState('fresh');
   const [tip, setTip] = useState(null);
+  const [view, setView] = useState('raft'); // raft | txn
+  const [txnScenario, setTxnScenario] = useState(null);
+  const [sel, setSel] = useState(0); // inspected group, 2PC view
   const [, force] = useState(0);
 
-  /* main loop */
+  /* main loop — only the visible world is ticked. The other freezes where you
+     left it instead of burning simulated time and flooding its event log. */
   useEffect(() => {
     let raf,
       last = performance.now();
@@ -990,7 +1791,7 @@ function App() {
         let sd = Math.min(dt, 200) * ui.current.speed;
         while (sd > 0) {
           const s = Math.min(sd, MAX_STEP);
-          tick(world.current, s);
+          if (ui.current.view === 'txn') tickTxn(txnWorld.current, s);else tick(world.current, s);
           sd -= s;
         }
       }
@@ -1001,8 +1802,11 @@ function App() {
     return () => cancelAnimationFrame(raf);
   }, []);
   const W = world.current;
+  const T = txnWorld.current;
+  const isTxn = view === 'txn';
+  ui.current.view = view;
 
-  /* ---- controls ---- */
+  /* ---- controls, shared by both views ---- */
   const toggleRun = () => {
     ui.current.running = !ui.current.running;
     setRunning(ui.current.running);
@@ -1011,26 +1815,43 @@ function App() {
     ui.current.running = false;
     setRunning(false);
   };
+  const advance = ms => {
+    if (isTxn) tickTxn(T, ms);else tick(W, ms);
+  };
+  const events = () => isTxn ? T.events : W.events;
   const stepOnce = () => {
     pause();
-    tick(W, 120);
+    advance(120);
     force(f => f + 1);
   };
   const stepEvent = () => {
     pause();
-    const before = W.events.length;
+    const before = events().length;
     let spent = 0;
-    while (spent < 8000 && W.events.length === before) {
-      tick(W, 40);
+    while (spent < 8000 && events().length === before) {
+      advance(40);
       spent += 40;
     }
     force(f => f + 1);
   };
+
+  /* Every group in the 2PC world holds the same cfg object by reference, so
+     one patch reaches all of them. */
   const setCfg = patch => {
-    Object.assign(W.cfg, patch);
+    const c = isTxn ? T.cfg : W.cfg;
+    Object.assign(c, patch);
     setCfgState({
-      ...W.cfg
+      ...c
     });
+  };
+  const switchView = v => {
+    setView(v);
+    ui.current.view = v;
+    setCfgState({
+      ...(v === 'txn' ? T.cfg : W.cfg)
+    });
+    ui.current.running = true;
+    setRunning(true);
   };
   const loadScenario = key => {
     world.current = SCENARIOS[key].build({
@@ -1092,24 +1913,12 @@ function App() {
   const addNode = () => {
     if (W.nodes.length >= 9) return;
     const t = Math.max(0, ...W.nodes.map(n => n.currentTerm));
-    const n = makeNode(t);
-    n.timeoutInit = n.timeout;
-    n.lastHeard = 0;
-    W.nodes.push(n);
+    const n = addNodeTo(W, t);
     emit(W, n.id, `joins the cluster — quorum is now ${quorum(W.nodes.length)}/${W.nodes.length}`, 'sys');
   };
   const removeNode = () => {
     if (W.nodes.length <= 3) return;
-    const n = W.nodes.pop();
-    W.msgs = W.msgs.filter(m => m.from !== n.id && m.to !== n.id);
-    // Drop every trace of it, or a stale vote/matchIndex still counts toward
-    // a quorum that is now smaller than it was.
-    W.nodes.forEach(o => {
-      delete o.nextIndex[n.id];
-      delete o.matchIndex[n.id];
-      delete o.votes[n.id];
-      delete o.preVotes[n.id];
-    });
+    const n = removeNodeFrom(W);
     emit(W, n.id, `removed — quorum is now ${quorum(W.nodes.length)}/${W.nodes.length}`, 'sys');
   };
   const clientCmd = () => {
@@ -1128,21 +1937,169 @@ function App() {
     L.hbTimer = HEARTBEAT;
   };
 
+  /* ---- 2PC controls ---- *
+   * Adding and removing nodes MUTATES the group's live world, so its Raft
+   * log — and therefore its 2PC records — survive the resize. Only the
+   * controls that have to rebuild a group discard the transaction, and they
+   * say so in the event log rather than silently refusing.               */
+  const txnClickNode = (gid, id) => {
+    const g = T.groups[gid];
+    if (!g) return;
+    const n = byId(g.W, id);
+    if (!n) return;
+    if (mode === 'partition') {
+      const parts = Math.max(2, new Set(g.W.nodes.map(x => x.partition)).size);
+      n.partition = (n.partition + 1) % Math.min(parts + 1, 3);
+      emit(g.W, n.id, `moved to network group ${GROUP_NAMES[n.partition]}`, 'sys');
+    } else if (n.state === 'down') {
+      n.state = 'follower';
+      n.votes = {};
+      n.preVotes = {};
+      n.preVoteTerm = 0;
+      n.phase = null;
+      n.leaderId = null;
+      n.lastHeard = ELECTION_MAX;
+      resetTimeout(g.W, n);
+      emit(g.W, n.id, `restarts as FOLLOWER — keeps term ${n.currentTerm} and ${lastIndex(n)} log entries`, 'sys');
+      emitT(T, gid, `N${n.id} restarts in ${g.name}`, 'sys');
+    } else {
+      const was = n.state;
+      n.state = 'down';
+      n.votes = {};
+      n.preVotes = {};
+      n.preVoteTerm = 0;
+      n.phase = null;
+      n.leaderId = null;
+      emit(g.W, n.id, `CRASHED (was ${was.toUpperCase()})`, 'crash');
+      emitT(T, gid, `N${n.id} CRASHED in ${g.name}${was === 'leader' ? ' — it was the leader' : ''}`, 'crash');
+    }
+    setSel(gid);
+  };
+  const txnClickLink = (a, b) => {
+    const k = linkKey(a, b);
+    const next = LINK_CYCLE[T.links[k]];
+    if (next === undefined) delete T.links[k];else T.links[k] = next;
+    const lo = Math.min(a, b),
+      hi = Math.max(a, b);
+    const nm = gid => T.groups[gid] ? T.groups[gid].name : 'group ' + gid;
+    emitT(T, -1, next === undefined ? `${nm(lo)}–${nm(hi)} link restored` : next === 'cut' ? `${nm(lo)}–${nm(hi)} CUT in both directions` : next === 'lo2hi' ? `${nm(lo)}→${nm(hi)} cut one-way (the reverse still works)` : `${nm(hi)}→${nm(lo)} cut one-way (the reverse still works)`, 'sys');
+  };
+  const txnHeal = () => {
+    T.links = {};
+    T.groups.forEach(g => {
+      g.partition = 0;
+      g.W.links = {};
+      g.W.nodes.forEach(n => n.partition = 0);
+    });
+    emitT(T, -1, 'network healed — every group reconnected and every internal link restored', 'sys');
+  };
+  const groupAdd = () => {
+    const g = T.groups[sel];
+    if (!g || g.W.nodes.length >= 7) return;
+    const t = Math.max(0, ...g.W.nodes.map(n => n.currentTerm));
+    const n = addNodeTo(g.W, t);
+    emit(g.W, n.id, `joins — quorum is now ${quorum(g.W.nodes.length)}/${g.W.nodes.length}`, 'sys');
+    emitT(T, sel, `${g.name} grows to ${g.W.nodes.length} nodes — quorum ${quorum(g.W.nodes.length)}` + (g.role === 'coord' && g.W.nodes.length === 2 ? ', and it is no longer a single point of failure' : ''), 'sys');
+  };
+  const groupRemove = () => {
+    const g = T.groups[sel];
+    if (!g || g.W.nodes.length <= 1) return;
+    const n = removeNodeFrom(g.W);
+    emitT(T, sel, `N${n.id} removed from ${g.name} — quorum is now ${quorum(g.W.nodes.length)}/${g.W.nodes.length}` + (g.role === 'coord' && g.W.nodes.length === 1 ? ', and it is a single point of failure again' : ''), 'sys');
+  };
+
+  /* Rebuilds groups, so any live transaction goes with them. */
+  const rebuild = (coordSize, shardSizes, why) => {
+    resetTxn(T, why);
+    const keep = T.groups.map(g => g.willVote);
+    const fresh = makeTxnWorld(coordSize, shardSizes, T.cfg);
+    fresh.events = T.events;
+    fresh.nextEid = T.nextEid;
+    fresh.clock = T.clock;
+    fresh.txnSeq = T.txnSeq;
+    fresh.groups.forEach((g, i) => {
+      if (keep[i]) g.willVote = keep[i];
+    });
+    txnWorld.current = fresh;
+    setSel(s => Math.min(s, fresh.groups.length - 1));
+    setTxnScenario(null);
+    emitT(fresh, -1, `topology is now 1 coordinator ×${coordSize} + ${shardSizes.length} shard(s) ×${shardSizes.join('/')}`, 'sys');
+  };
+  const setShards = d => {
+    const cur = T.groups.slice(1).map(g => g.W.nodes.length);
+    const next = d > 0 ? [...cur, 3] : cur.slice(0, -1);
+    if (next.length < 1 || next.length > 3) return;
+    rebuild(T.groups[0].W.nodes.length, next, 'the shard count changed');
+  };
+  const toggleFT = () => {
+    const solo = T.groups[0].W.nodes.length === 1;
+    rebuild(solo ? 3 : 1, T.groups.slice(1).map(g => g.W.nodes.length), solo ? 'the coordinator was replicated' : 'the coordinator was reduced to one machine');
+  };
+  const cycleVote = gid => {
+    const g = T.groups[gid];
+    if (!g) return;
+    g.willVote = g.willVote === 'yes' ? 'no' : 'yes';
+    emitT(T, gid, `${g.name} will now answer ${g.willVote.toUpperCase()} when it is asked to prepare`, 'sys');
+  };
+  const beginTransaction = () => {
+    beginTxn(T);
+  };
+  const loadTxnScenario = key => {
+    txnWorld.current = TXN_SCENARIOS[key].build({
+      ...T.cfg
+    });
+    txnWorld.current.note = TXN_SCENARIOS[key].note;
+    setTxnScenario(key);
+    setSel(0);
+    setCfgState({
+      ...txnWorld.current.cfg
+    });
+    ui.current.running = true;
+    setRunning(true);
+    emitT(txnWorld.current, -1, `scenario loaded: ${TXN_SCENARIOS[key].label}`, 'sys');
+  };
+  const restart = () => {
+    if (!isTxn) return loadScenario(scenario);
+    if (txnScenario) return loadTxnScenario(txnScenario);
+    rebuild(T.groups[0].W.nodes.length, T.groups.slice(1).map(g => g.W.nodes.length), 'the view was reset');
+  };
+
   /* ---- derived ---- */
   const maxTerm = Math.max(0, ...W.nodes.map(n => n.currentTerm));
   const leader = W.nodes.find(n => n.state === 'leader');
   const live = W.nodes.filter(n => n.state !== 'down').length;
-  const ex = explain(W);
+  const ex = isTxn ? explainTxn(T) : explain(W);
   const q = quorum(W.nodes.length);
+  const selG = T.groups[Math.min(sel, T.groups.length - 1)];
+  const selLead = selG && groupLeader(selG);
+  const txnPh = isTxn ? txnPhase(T) : null;
+  const nLocks = isTxn ? txnLocked(T).length : 0;
+  const note = isTxn ? T.note : W.note;
   return /*#__PURE__*/React.createElement("div", {
     className: "app"
   }, /*#__PURE__*/React.createElement("div", {
     className: "head"
-  }, /*#__PURE__*/React.createElement("h2", null, "\u2699\uFE0F Raft Consensus Visualizer"), /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("h2", null, isTxn ? '🔀 Two-Phase Commit over Raft' : '⚙️ Raft Consensus Visualizer'), /*#__PURE__*/React.createElement("span", {
     className: "sub"
-  }, "leader election \xB7 log replication \xB7 partitions"), /*#__PURE__*/React.createElement("div", {
+  }, isTxn ? 'atomic commit across replicated groups · the coordinator is a Raft group too' : 'leader election · log replication · partitions'), /*#__PURE__*/React.createElement("div", {
     className: "stat"
-  }, /*#__PURE__*/React.createElement("span", {
+  }, isTxn ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("span", {
+    className: "chip"
+  }, "groups ", /*#__PURE__*/React.createElement("b", null, T.groups.length)), /*#__PURE__*/React.createElement("span", {
+    className: "chip"
+  }, "txn ", /*#__PURE__*/React.createElement("b", null, T.txn ? T.txn.id : '—')), /*#__PURE__*/React.createElement("span", {
+    className: "chip"
+  }, "phase ", /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: PHASE_TONE[txnPh]
+    }
+  }, txnPh)), /*#__PURE__*/React.createElement("span", {
+    className: "chip"
+  }, "locks held ", /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: nLocks ? 'var(--down)' : 'var(--leader)'
+    }
+  }, nLocks))) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("span", {
     className: "chip"
   }, "term ", /*#__PURE__*/React.createElement("b", null, maxTerm)), /*#__PURE__*/React.createElement("span", {
     className: "chip"
@@ -1158,7 +2115,26 @@ function App() {
     style: {
       color: leader ? 'var(--leader)' : 'var(--down)'
     }
-  }, leader ? 'N' + leader.id : 'none')))), /*#__PURE__*/React.createElement("div", {
+  }, leader ? 'N' + leader.id : 'none'))))), /*#__PURE__*/React.createElement("div", {
+    className: "bar"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "barlab"
+  }, "View"), /*#__PURE__*/React.createElement("button", {
+    className: 'btn ' + (!isTxn ? 'on' : ''),
+    onClick: () => switchView('raft'),
+    title: "one Raft cluster: elections, replication, partitions"
+  }, "\u2699\uFE0F Raft cluster"), /*#__PURE__*/React.createElement("button", {
+    className: 'btn ' + (isTxn ? 'on' : ''),
+    onClick: () => switchView('txn'),
+    title: "a distributed transaction across several Raft groups"
+  }, "\uD83D\uDD00 2PC over Raft"), /*#__PURE__*/React.createElement("span", {
+    className: "hint",
+    style: {
+      margin: 0,
+      flex: '1 1 260px',
+      minWidth: 180
+    }
+  }, isTxn ? 'Every bubble is a full Raft group. The other view is paused where you left it.' : 'The 2PC view runs this same engine, several clusters at a time.')), /*#__PURE__*/React.createElement("div", {
     className: "bar"
   }, /*#__PURE__*/React.createElement("span", {
     className: "barlab"
@@ -1188,8 +2164,8 @@ function App() {
     className: "sep"
   }), /*#__PURE__*/React.createElement("button", {
     className: "btn warn",
-    onClick: () => loadScenario(scenario)
-  }, "\u21BA Restart scenario")), /*#__PURE__*/React.createElement("div", {
+    onClick: restart
+  }, "\u21BA Restart ", isTxn && !txnScenario ? 'view' : 'scenario')), !isTxn && /*#__PURE__*/React.createElement("div", {
     className: "bar"
   }, /*#__PURE__*/React.createElement("span", {
     className: "barlab"
@@ -1217,7 +2193,58 @@ function App() {
   }), /*#__PURE__*/React.createElement("button", {
     className: "btn primary",
     onClick: clientCmd
-  }, "\u2B06 Client command")), /*#__PURE__*/React.createElement("div", {
+  }, "\u2B06 Client command")), isTxn && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "bar"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "barlab"
+  }, "Groups"), T.groups.map(g => /*#__PURE__*/React.createElement("button", {
+    key: g.id,
+    className: 'btn ' + (sel === g.id ? 'on' : ''),
+    onClick: () => setSel(g.id),
+    title: "pick the group the panels on the right inspect"
+  }, g.name, " \xD7", g.W.nodes.length)), /*#__PURE__*/React.createElement("div", {
+    className: "sep"
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: groupAdd,
+    disabled: !selG || selG.W.nodes.length >= 7,
+    title: "grows the selected group without rebuilding it \u2014 its log survives"
+  }, "\uFF0B node"), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: groupRemove,
+    disabled: !selG || selG.W.nodes.length <= 1
+  }, "\uFF0D node"), /*#__PURE__*/React.createElement("div", {
+    className: "sep"
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: () => setShards(-1),
+    disabled: T.groups.length <= 2
+  }, "\uFF0D shard"), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: () => setShards(1),
+    disabled: T.groups.length >= 4
+  }, "\uFF0B shard")), /*#__PURE__*/React.createElement("div", {
+    className: "bar"
+  }, /*#__PURE__*/React.createElement("span", {
+    className: "barlab"
+  }, "Transaction"), /*#__PURE__*/React.createElement("button", {
+    className: "btn primary",
+    onClick: beginTransaction,
+    disabled: !!T.txn && !txnDone(T)
+  }, "\u2B06 Begin transaction"), /*#__PURE__*/React.createElement("button", {
+    className: 'btn ' + (T.groups[0].W.nodes.length > 1 ? 'on' : 'warn'),
+    onClick: toggleFT,
+    title: "a one-node coordinator is textbook 2PC; three nodes is the fix. Rebuilds the group, so it clears any running transaction"
+  }, T.groups[0].W.nodes.length > 1 ? '✓ ' : '', "\uD83D\uDEE1 Replicated coordinator"), /*#__PURE__*/React.createElement("button", {
+    className: 'btn ' + (mode === 'crash' ? 'on' : ''),
+    onClick: () => setMode('crash')
+  }, "\uD83D\uDCA5 Crash mode"), /*#__PURE__*/React.createElement("button", {
+    className: 'btn ' + (mode === 'partition' ? 'on' : ''),
+    onClick: () => setMode('partition')
+  }, "\u2702\uFE0F Partition mode"), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: txnHeal
+  }, "\uD83D\uDD17 Heal network"))), /*#__PURE__*/React.createElement("div", {
     className: "bar"
   }, /*#__PURE__*/React.createElement("span", {
     className: "barlab"
@@ -1261,7 +2288,11 @@ function App() {
     className: "bar"
   }, /*#__PURE__*/React.createElement("span", {
     className: "barlab"
-  }, "Scenario"), Object.keys(SCENARIOS).map(k => /*#__PURE__*/React.createElement("button", {
+  }, "Scenario"), isTxn ? Object.keys(TXN_SCENARIOS).map(k => /*#__PURE__*/React.createElement("button", {
+    key: k,
+    className: 'btn ' + (txnScenario === k ? 'on' : ''),
+    onClick: () => loadTxnScenario(k)
+  }, TXN_SCENARIOS[k].label)) : Object.keys(SCENARIOS).map(k => /*#__PURE__*/React.createElement("button", {
     key: k,
     className: 'btn ' + (scenario === k ? 'on' : ''),
     onClick: () => loadScenario(k)
@@ -1269,7 +2300,7 @@ function App() {
     className: "grid"
   }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     className: "card"
-  }, /*#__PURE__*/React.createElement("h2", null, "Cluster", /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("h2", null, isTxn ? 'Groups' : 'Cluster', /*#__PURE__*/React.createElement("span", {
     style: {
       marginLeft: 'auto',
       fontWeight: 600,
@@ -1281,7 +2312,14 @@ function App() {
     style: {
       padding: 6
     }
-  }, /*#__PURE__*/React.createElement(Stage, {
+  }, isTxn ? /*#__PURE__*/React.createElement(TxnStage, {
+    T: T,
+    onClick: txnClickNode,
+    mode: mode,
+    onTip: setTip,
+    onLink: txnClickLink,
+    sel: sel
+  }) : /*#__PURE__*/React.createElement(Stage, {
     W: W,
     onClick: clickNode,
     mode: mode,
@@ -1301,7 +2339,28 @@ function App() {
   }), /*#__PURE__*/React.createElement(L, {
     c: "var(--down)",
     t: "Crashed"
+  }), isTxn ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(L, {
+    c: "var(--pv)",
+    t: "Prepare"
   }), /*#__PURE__*/React.createElement(L, {
+    c: "var(--grant)",
+    t: "Prepared \u2713 yes"
+  }), /*#__PURE__*/React.createElement(L, {
+    c: "var(--deny)",
+    t: "Prepared \u2717 no"
+  }), /*#__PURE__*/React.createElement(L, {
+    c: "var(--leader)",
+    t: "Decide D commit"
+  }), /*#__PURE__*/React.createElement(L, {
+    c: "var(--down)",
+    t: "Decide A abort"
+  }), /*#__PURE__*/React.createElement(L, {
+    c: "var(--ae)",
+    t: "Ack / Raft traffic inside a group"
+  }), /*#__PURE__*/React.createElement(L, {
+    c: "#ef4444",
+    t: "\u2715 groups cut apart"
+  })) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(L, {
     c: "var(--pv)",
     t: "PreVote"
   }), /*#__PURE__*/React.createElement(L, {
@@ -1322,15 +2381,19 @@ function App() {
   }), /*#__PURE__*/React.createElement(L, {
     c: "#f59e0b",
     t: "\u27A4 link cut one way"
-  })), /*#__PURE__*/React.createElement("div", {
+  }))), /*#__PURE__*/React.createElement("div", {
     className: "hint"
-  }, /*#__PURE__*/React.createElement("b", {
+  }, isTxn ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("b", {
     style: {
       color: 'var(--muted)'
     }
-  }, "Click a wire"), " between two nodes to cycle it: healthy \u2192 fully cut \u2192 one-way \u2192 the other one-way \u2192 healthy. A one-way cut lets a node send but never receive \u2014 that is how a node becomes unreachable to only ", /*#__PURE__*/React.createElement("i", null, "some"), " peers without being offline. Ring around each node = its election-timeout countdown on a shared scale. Hover any flying message for its RPC payload.")), /*#__PURE__*/React.createElement("div", {
+  }, "The row of boxes under each group is its 2PC record"), " in that group's own Raft log \u2014 solid once a majority stores it, faded dashed until then. Nothing is ever said out loud before its box goes solid, which is the whole difference between this and textbook 2PC. Click the wire between two groups to cut them apart, click any node to crash it, and hover anything for detail.") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: 'var(--muted)'
+    }
+  }, "Click a wire"), " between two nodes to cycle it: healthy \u2192 fully cut \u2192 one-way \u2192 the other one-way \u2192 healthy. A one-way cut lets a node send but never receive \u2014 that is how a node becomes unreachable to only ", /*#__PURE__*/React.createElement("i", null, "some"), " peers without being offline. Ring around each node = its election-timeout countdown on a shared scale. Hover any flying message for its RPC payload."))), /*#__PURE__*/React.createElement("div", {
     className: "card"
-  }, /*#__PURE__*/React.createElement("h2", null, "Replicated logs ", /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("h2", null, "Replicated logs", isTxn ? ' — ' + (selG ? selG.name : '') : '', " ", /*#__PURE__*/React.createElement("span", {
     style: {
       marginLeft: 'auto',
       fontWeight: 600,
@@ -1342,10 +2405,10 @@ function App() {
     style: {
       padding: '3px 0'
     }
-  }, W.nodes.map(n => /*#__PURE__*/React.createElement(LogRow, {
+  }, (isTxn ? selG ? selG.W.nodes : [] : W.nodes).map(n => /*#__PURE__*/React.createElement(LogRow, {
     key: n.id,
     node: n,
-    leader: leader
+    leader: isTxn ? selLead : leader
   }))))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     className: "card"
   }, /*#__PURE__*/React.createElement("h2", null, "What is happening"), /*#__PURE__*/React.createElement("div", {
@@ -1362,7 +2425,7 @@ function App() {
     }
   }), /*#__PURE__*/React.createElement("div", {
     className: "why"
-  }, ex.why), W.note && /*#__PURE__*/React.createElement("div", {
+  }, ex.why), note && /*#__PURE__*/React.createElement("div", {
     className: "why",
     style: {
       color: 'var(--muted)'
@@ -1371,22 +2434,68 @@ function App() {
     style: {
       color: 'var(--txt)'
     }
-  }, "Scenario: "), W.note))), /*#__PURE__*/React.createElement("div", {
+  }, "Scenario: "), note))), isTxn && /*#__PURE__*/React.createElement("div", {
     className: "card"
-  }, /*#__PURE__*/React.createElement("h2", null, "Nodes"), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("h2", null, "Transaction"), /*#__PURE__*/React.createElement(TxnPanel, {
+    T: T,
+    onVote: cycleVote
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("h2", null, isTxn ? 'Nodes — ' + (selG ? selG.name : '') : 'Nodes'), /*#__PURE__*/React.createElement("div", {
     className: "insp"
-  }, W.nodes.map(n => /*#__PURE__*/React.createElement(NodeRow, {
+  }, (isTxn ? selG ? selG.W.nodes : [] : W.nodes).map(n => /*#__PURE__*/React.createElement(NodeRow, {
     key: n.id,
     node: n,
-    W: W,
-    onClick: clickNode,
-    mode: mode
+    W: isTxn ? selG.W : W,
+    mode: mode,
+    onClick: id => isTxn ? txnClickNode(selG.id, id) : clickNode(id)
   })))), /*#__PURE__*/React.createElement("div", {
     className: "card"
-  }, /*#__PURE__*/React.createElement("h2", null, "Event log"), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("h2", null, isTxn ? '2PC event log' : 'Event log'), /*#__PURE__*/React.createElement("div", {
     className: "log"
-  }, W.events.map(e => {
+  }, isTxn ? T.events.map(e => {
+    const g = e.nodeId >= 0 ? T.groups[e.nodeId] : null;
+    return /*#__PURE__*/React.createElement("div", {
+      className: "row",
+      key: e.id
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "t"
+    }, e.t, "s"), /*#__PURE__*/React.createElement("span", {
+      className: "n",
+      style: {
+        color: g ? groupLeader(g) ? 'var(--leader)' : 'var(--down)' : 'var(--dim)'
+      }
+    }, g ? g.role === 'coord' ? 'COORD' : SHARD_NAMES[g.id - 1] : '—'), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: EVENT_COLOR[e.kind] || 'var(--txt)'
+      }
+    }, e.text));
+  }) : W.events.map(e => {
     const n = e.nodeId < 0 ? null : byId(W, e.nodeId);
+    return /*#__PURE__*/React.createElement("div", {
+      className: "row",
+      key: e.id
+    }, /*#__PURE__*/React.createElement("span", {
+      className: "t"
+    }, e.t, "s"), /*#__PURE__*/React.createElement("span", {
+      className: "n",
+      style: {
+        color: n ? nodeColor(n.state) : 'var(--dim)'
+      }
+    }, e.nodeId < 0 ? '—' : 'N' + e.nodeId), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: EVENT_COLOR[e.kind] || 'var(--txt)'
+      }
+    }, e.text));
+  }))), isTxn && selG && /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("h2", null, "Inside ", selG.name), /*#__PURE__*/React.createElement("div", {
+    className: "log",
+    style: {
+      height: 180
+    }
+  }, selG.W.events.map(e => {
+    const n = e.nodeId < 0 ? null : byId(selG.W, e.nodeId);
     return /*#__PURE__*/React.createElement("div", {
       className: "row",
       key: e.id
@@ -1417,7 +2526,10 @@ const EVENT_COLOR = {
   crash: '#ef7d7d',
   log: '#93c5fd',
   down: '#cbd5e1',
-  sys: '#8aa0d0'
+  sys: '#8aa0d0',
+  /* 2PC */prep: '#f0abfc',
+  decide: '#34d399',
+  block: '#ef7d7d'
 };
 const L = ({
   c,
@@ -1485,7 +2597,99 @@ function payloadText(m) {
   return rows;
 }
 
-/* One inter-node wire. Fat transparent overlay makes it easy to hit. */
+/* Messages in flight. Shared by both stages: the 2PC view passes a scale, its
+   own look-up and its own payload formatter, and gets the same trail, halo,
+   glyph and drop animation for free. */
+function Msgs({
+  msgs,
+  pos,
+  onTip,
+  s = 1,
+  look = msgLook,
+  pay = payloadText
+}) {
+  return msgs.map(m => {
+    const p = pos[m.from],
+      r = pos[m.to];
+    if (!p || !r) return null;
+    const t = Math.min(m.progress, 1);
+    const x = p.x + (r.x - p.x) * t,
+      y = p.y + (r.y - p.y) * t;
+    const lk = look(m);
+    if (m.dead) {
+      const o = Math.max(0, 1 - m.fade / 450);
+      return /*#__PURE__*/React.createElement("g", {
+        key: m.id,
+        opacity: o
+      }, /*#__PURE__*/React.createElement("circle", {
+        cx: x,
+        cy: y,
+        r: (11 + m.fade / 28) * s,
+        fill: "none",
+        stroke: "var(--down)",
+        strokeWidth: 2 * s
+      }), /*#__PURE__*/React.createElement("text", {
+        x: x,
+        y: y + 4 * s,
+        textAnchor: "middle",
+        fontSize: 13 * s,
+        fontWeight: "900",
+        fill: "var(--down)"
+      }, "\u2715"), /*#__PURE__*/React.createElement("text", {
+        x: x,
+        y: y - 16 * s,
+        textAnchor: "middle",
+        fontSize: 8.5 * s,
+        fontWeight: "800",
+        fill: "var(--down)"
+      }, m.reason));
+    }
+    return /*#__PURE__*/React.createElement("g", {
+      key: m.id,
+      style: {
+        cursor: 'help'
+      },
+      onMouseEnter: e => onTip({
+        rows: pay(m),
+        x: e.clientX,
+        y: e.clientY
+      })
+    }, /*#__PURE__*/React.createElement("line", {
+      x1: p.x,
+      y1: p.y,
+      x2: x,
+      y2: y,
+      stroke: lk.c,
+      strokeWidth: "1.3",
+      opacity: "0.3",
+      strokeDasharray: "3 4"
+    }), /*#__PURE__*/React.createElement("circle", {
+      cx: x,
+      cy: y,
+      r: 13 * s,
+      fill: lk.c,
+      opacity: "0.15"
+    }), /*#__PURE__*/React.createElement("circle", {
+      cx: x,
+      cy: y,
+      r: 8.5 * s,
+      fill: lk.c,
+      filter: "url(#gl)"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: x,
+      y: y + 3.4 * s,
+      textAnchor: "middle",
+      fontSize: 9 * s,
+      fontWeight: "900",
+      fill: "#08122b",
+      pointerEvents: "none"
+    }, lk.l));
+  });
+}
+
+/* One wire. Fat transparent overlay makes it easy to hit. Used between nodes
+   in the Raft view and between whole groups in the 2PC view — `nm` is how it
+   learns to say "SHARD A" instead of "N3". */
 function Wire({
   a,
   b,
@@ -1493,7 +2697,8 @@ function Wire({
   pb,
   st,
   onLink,
-  onTip
+  onTip,
+  nm = id => 'N' + id
 }) {
   const partSplit = a.partition !== b.partition;
   const lo = Math.min(a.id, b.id),
@@ -1523,7 +2728,7 @@ function Wire({
   const sp = src === a.id ? pa : pb,
     dp = dst === a.id ? pa : pb;
   const ang = Math.atan2(dp.y - sp.y, dp.x - sp.x) * 180 / Math.PI;
-  const label = st === 'cut' ? `N${lo} ⇄ N${hi} fully cut` : st ? `N${src} ⇢ N${dst} blocked (reverse still works)` : `N${lo} ⇄ N${hi} healthy — click to cut`;
+  const label = st === 'cut' ? `${nm(lo)} ⇄ ${nm(hi)} fully cut` : st ? `${nm(src)} ⇢ ${nm(dst)} blocked (reverse still works)` : `${nm(lo)} ⇄ ${nm(hi)} healthy — click to cut`;
   return /*#__PURE__*/React.createElement("g", null, /*#__PURE__*/React.createElement("line", {
     x1: pa.x,
     y1: pa.y,
@@ -1651,82 +2856,10 @@ function Stage({
     st: W.links[linkKey(a.id, b.id)],
     onLink: onLink,
     onTip: onTip
-  }))), W.msgs.map(m => {
-    const p = pos[m.from],
-      r = pos[m.to];
-    if (!p || !r) return null;
-    const t = Math.min(m.progress, 1);
-    const x = p.x + (r.x - p.x) * t,
-      y = p.y + (r.y - p.y) * t;
-    const look = msgLook(m);
-    if (m.dead) {
-      const o = Math.max(0, 1 - m.fade / 450);
-      return /*#__PURE__*/React.createElement("g", {
-        key: m.id,
-        opacity: o
-      }, /*#__PURE__*/React.createElement("circle", {
-        cx: x,
-        cy: y,
-        r: 11 + m.fade / 28,
-        fill: "none",
-        stroke: "var(--down)",
-        strokeWidth: "2"
-      }), /*#__PURE__*/React.createElement("text", {
-        x: x,
-        y: y + 4,
-        textAnchor: "middle",
-        fontSize: "13",
-        fontWeight: "900",
-        fill: "var(--down)"
-      }, "\u2715"), /*#__PURE__*/React.createElement("text", {
-        x: x,
-        y: y - 16,
-        textAnchor: "middle",
-        fontSize: "8.5",
-        fontWeight: "800",
-        fill: "var(--down)"
-      }, m.reason));
-    }
-    return /*#__PURE__*/React.createElement("g", {
-      key: m.id,
-      style: {
-        cursor: 'help'
-      },
-      onMouseEnter: e => onTip({
-        rows: payloadText(m),
-        x: e.clientX,
-        y: e.clientY
-      })
-    }, /*#__PURE__*/React.createElement("line", {
-      x1: p.x,
-      y1: p.y,
-      x2: x,
-      y2: y,
-      stroke: look.c,
-      strokeWidth: "1.3",
-      opacity: "0.3",
-      strokeDasharray: "3 4"
-    }), /*#__PURE__*/React.createElement("circle", {
-      cx: x,
-      cy: y,
-      r: "13",
-      fill: look.c,
-      opacity: "0.15"
-    }), /*#__PURE__*/React.createElement("circle", {
-      cx: x,
-      cy: y,
-      r: "8.5",
-      fill: look.c,
-      filter: "url(#gl)"
-    }), /*#__PURE__*/React.createElement("text", {
-      x: x,
-      y: y + 3.4,
-      textAnchor: "middle",
-      fontSize: "9",
-      fontWeight: "900",
-      fill: "#08122b",
-      pointerEvents: "none"
-    }, look.l));
+  }))), /*#__PURE__*/React.createElement(Msgs, {
+    msgs: W.msgs,
+    pos: pos,
+    onTip: onTip
   }), nodes.map(n => {
     const {
       x,
@@ -1852,6 +2985,337 @@ function Stage({
 }
 
 /* ================================================================== *
+ *  2PC STAGE                                                          *
+ * ================================================================== */
+
+/* Coordinator on top, shards in a row beneath — the way every textbook
+   draws 2PC, and it keeps the inter-group wires from crossing. Ring and
+   node radii shrink with the member count so that no combination of
+   1..3 shards by 1..7 nodes can overlap or run off the canvas. */
+function txnLayout(T) {
+  const VW = 700,
+    VH = 580;
+  const S = Math.max(1, T.groups.length - 1);
+  const SLOT = Math.min(300, 640 / S);
+  const out = {
+    VW,
+    VH,
+    groups: [],
+    centres: {}
+  };
+  for (const g of T.groups) {
+    const shard = g.role === 'shard';
+    const cx = shard ? VW / 2 + (g.id - 1 - (S - 1) / 2) * SLOT : VW / 2;
+    const cy = shard ? 415 : 140;
+    const half = shard ? Math.min(150, SLOT / 2 - 8) : 150;
+    const k = g.W.nodes.length;
+    const nr = k === 1 ? 26 : k <= 3 ? 21 : k <= 5 ? 17 : 14;
+    const gr = k === 1 ? 0 : Math.min(half - nr - 6, 22 + k * 7);
+    const pos = {};
+    g.W.nodes.forEach((n, j) => {
+      const a = -Math.PI / 2 + j * 2 * Math.PI / k;
+      pos[n.id] = {
+        x: cx + gr * Math.cos(a),
+        y: cy + gr * Math.sin(a)
+      };
+    });
+    out.groups.push({
+      g,
+      cx,
+      cy,
+      nr,
+      gr,
+      r: gr + nr + 7,
+      s: nr / NODE_R,
+      pos
+    });
+    out.centres[g.id] = {
+      x: cx,
+      y: cy
+    };
+  }
+  return out;
+}
+
+/* The 2PC records in a group's log, newest `max`, read off its leader (or,
+   if it has none, off whichever node knows the most). */
+function txnRecords(g, max) {
+  const src = groupLeader(g) || g.W.nodes.slice().sort((a, b) => b.log.length - a.log.length)[0];
+  if (!src) return {
+    src: null,
+    recs: []
+  };
+  const recs = [];
+  src.log.forEach((e, i) => {
+    if (e.txn) recs.push({
+      e,
+      index: i + 1,
+      committed: i + 1 <= src.commitIndex
+    });
+  });
+  return {
+    src,
+    recs: recs.slice(-max)
+  };
+}
+const TXN_STYLE = {
+  Prepare: {
+    c: 'var(--pv)',
+    l: 'P'
+  },
+  Prepared: {
+    c: 'var(--grant)',
+    l: '✓'
+  },
+  Decide: {
+    c: 'var(--leader)',
+    l: 'D'
+  },
+  Ack: {
+    c: 'var(--ae)',
+    l: 'a'
+  }
+};
+function txnLook(m) {
+  if (m.type === 'Prepared') return {
+    c: m.payload.vote === 'yes' ? 'var(--grant)' : 'var(--deny)',
+    l: m.payload.vote === 'yes' ? '✓' : '✗'
+  };
+  if (m.type === 'Decide') return {
+    c: m.payload.dec === 'commit' ? 'var(--leader)' : 'var(--down)',
+    l: m.payload.dec === 'commit' ? 'D' : 'A'
+  };
+  return TXN_STYLE[m.type] || {
+    c: '#94a3b8',
+    l: '·'
+  };
+}
+/* Endpoints are groups, not nodes, so this cannot share payloadText. */
+const txnPayload = T => m => {
+  const p = m.payload;
+  const nm = gid => T.groups[gid] ? T.groups[gid].name : 'group ' + gid;
+  const ep = (gid, node) => nm(gid) + (node !== null && node !== undefined ? ' · leader N' + node : '');
+  const rows = [['type', m.type], ['from', ep(m.from, m.fromNode)], ['to', ep(m.to, m.toNode)], ['txn', p.txn]];
+  if (m.type === 'Prepared') rows.push(['vote', p.vote], ['from log index', p.index]);
+  if (m.type === 'Decide') rows.push(['decision', p.dec]);
+  if (m.type === 'Ack') rows.push(['applied', p.dec], ['at log index', p.index]);
+  return rows;
+};
+
+/* A node drawn small. The full Stage glyph stacks five rows of text that
+   simply do not fit at r=14, so the details move to the hover tooltip. */
+function NodeMini({
+  n,
+  x,
+  y,
+  r,
+  onClick,
+  onTip
+}) {
+  const col = nodeColor(n.state);
+  const down = n.state === 'down';
+  const ring = n.state === 'follower' || n.state === 'candidate';
+  const frac = Math.max(0, Math.min(1, n.timeout / ELECTION_MAX));
+  const C = 2 * Math.PI * (r + 4);
+  return /*#__PURE__*/React.createElement("g", {
+    style: {
+      cursor: 'pointer'
+    },
+    onClick: e => {
+      e.stopPropagation();
+      onClick(n.id);
+    },
+    onMouseEnter: e => onTip({
+      rows: [['node', 'N' + n.id], ['state', n.phase === 'prevote' ? 'pre-vote' : n.state], ['currentTerm', n.currentTerm], ['votedFor', n.votedFor === null ? '∅' : 'N' + n.votedFor], ['log length', lastIndex(n)], ['commitIndex', n.commitIndex]],
+      x: e.clientX,
+      y: e.clientY
+    }),
+    onMouseLeave: () => onTip(null)
+  }, ring && /*#__PURE__*/React.createElement("circle", {
+    cx: x,
+    cy: y,
+    r: r + 4,
+    fill: "none",
+    stroke: "#22305c",
+    strokeWidth: "2.5"
+  }), ring && /*#__PURE__*/React.createElement("circle", {
+    cx: x,
+    cy: y,
+    r: r + 4,
+    fill: "none",
+    stroke: n.phase === 'prevote' ? 'var(--pv)' : n.state === 'candidate' ? 'var(--candidate)' : '#3d5aa8',
+    strokeWidth: "2.5",
+    strokeLinecap: "round",
+    strokeDasharray: C,
+    strokeDashoffset: C * (1 - frac),
+    transform: `rotate(-90 ${x} ${y})`
+  }), /*#__PURE__*/React.createElement("circle", {
+    cx: x,
+    cy: y,
+    r: r,
+    fill: down ? '#2a1420' : '#0f1a3a',
+    stroke: col,
+    strokeWidth: n.state === 'leader' ? 3 : 2,
+    strokeDasharray: down ? '4 3' : 'none',
+    filter: n.state === 'leader' ? 'url(#gl)' : 'none'
+  }), /*#__PURE__*/React.createElement("text", {
+    x: x,
+    y: y + r * 0.3,
+    textAnchor: "middle",
+    fontSize: r * 0.8,
+    fontWeight: "900",
+    fill: col,
+    pointerEvents: "none"
+  }, n.id), n.state === 'leader' && /*#__PURE__*/React.createElement("text", {
+    x: x,
+    y: y - r - 3,
+    textAnchor: "middle",
+    fontSize: r * 0.7,
+    pointerEvents: "none"
+  }, "\uD83D\uDC51"), down && /*#__PURE__*/React.createElement("text", {
+    x: x,
+    y: y - r - 3,
+    textAnchor: "middle",
+    fontSize: r * 0.65,
+    pointerEvents: "none"
+  }, "\uD83D\uDC80"));
+}
+function TxnStage({
+  T,
+  onClick,
+  mode,
+  onTip,
+  onLink,
+  sel
+}) {
+  const lay = txnLayout(T);
+  const ctr = lay.centres;
+  const nm = gid => T.groups[gid] ? T.groups[gid].name : 'group ' + gid;
+  return /*#__PURE__*/React.createElement("svg", {
+    className: "stage",
+    viewBox: `0 0 ${lay.VW} ${lay.VH}`,
+    onMouseLeave: () => onTip(null)
+  }, /*#__PURE__*/React.createElement("defs", null, /*#__PURE__*/React.createElement("filter", {
+    id: "gl",
+    x: "-60%",
+    y: "-60%",
+    width: "220%",
+    height: "220%"
+  }, /*#__PURE__*/React.createElement("feGaussianBlur", {
+    stdDeviation: "4",
+    result: "b"
+  }), /*#__PURE__*/React.createElement("feMerge", null, /*#__PURE__*/React.createElement("feMergeNode", {
+    in: "b"
+  }), /*#__PURE__*/React.createElement("feMergeNode", {
+    in: "SourceGraphic"
+  })))), T.groups.slice(1).map(g => /*#__PURE__*/React.createElement(Wire, {
+    key: 'w' + g.id,
+    a: T.groups[0],
+    b: g,
+    pa: ctr[0],
+    pb: ctr[g.id],
+    st: T.links[linkKey(0, g.id)],
+    onLink: onLink,
+    onTip: onTip,
+    nm: nm
+  })), lay.groups.map(gl => {
+    const g = gl.g;
+    const Ld = groupLeader(g);
+    const col = Ld ? 'var(--leader)' : 'var(--down)';
+    const alive = g.W.nodes.filter(n => n.state !== 'down').length;
+    const term = Math.max(0, ...g.W.nodes.map(n => n.currentTerm));
+    const fate = g.role === 'shard' ? shardFate(T, g) : null;
+    const {
+      recs
+    } = txnRecords(g, 6);
+    const sy = gl.cy + gl.r + 6;
+    return /*#__PURE__*/React.createElement("g", {
+      key: g.id
+    }, /*#__PURE__*/React.createElement("circle", {
+      cx: gl.cx,
+      cy: gl.cy,
+      r: gl.r,
+      fill: sel === g.id ? '#111c40' : '#0c1430',
+      opacity: "0.6",
+      stroke: col,
+      strokeWidth: sel === g.id ? 2.2 : 1.2,
+      strokeDasharray: "7 6"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: gl.cx,
+      y: gl.cy - gl.r - 7,
+      textAnchor: "middle",
+      fontSize: "11",
+      fontWeight: "800",
+      fill: col,
+      letterSpacing: "1"
+    }, g.name, fate && fate.locked ? ' 🔒' : '', " \xB7 term ", term, " \xB7 ", alive, "/", g.W.nodes.length, " up", Ld ? '' : ' · NO LEADER'), /*#__PURE__*/React.createElement(Msgs, {
+      msgs: g.W.msgs,
+      pos: gl.pos,
+      onTip: onTip,
+      s: gl.s
+    }), g.W.nodes.map(n => /*#__PURE__*/React.createElement(NodeMini, {
+      key: n.id,
+      n: n,
+      x: gl.pos[n.id].x,
+      y: gl.pos[n.id].y,
+      r: gl.nr,
+      onClick: id => onClick(g.id, id),
+      onTip: onTip
+    })), mode === 'partition' && g.W.nodes.map(n => /*#__PURE__*/React.createElement("text", {
+      key: 'p' + n.id,
+      x: gl.pos[n.id].x - gl.nr - 3,
+      y: gl.pos[n.id].y - gl.nr + 2,
+      textAnchor: "middle",
+      fontSize: "10",
+      fontWeight: "900",
+      fill: "var(--muted)",
+      pointerEvents: "none"
+    }, GROUP_NAMES[n.partition])), recs.map((r, i) => {
+      const bw = 17,
+        x0 = gl.cx - recs.length * bw / 2 + i * bw;
+      const c = termColor(r.e.term);
+      return /*#__PURE__*/React.createElement("g", {
+        key: r.index,
+        style: {
+          cursor: 'help'
+        },
+        onMouseEnter: e => onTip({
+          rows: [['group', g.name], ['record', r.e.rec], ['txn', r.e.txn], ['log index', r.index], ['term', r.e.term], ['state', r.committed ? 'committed — durable' : 'appended, NOT yet committed']],
+          x: e.clientX,
+          y: e.clientY
+        })
+      }, /*#__PURE__*/React.createElement("rect", {
+        x: x0,
+        y: sy,
+        width: "15",
+        height: "15",
+        rx: "3",
+        fill: c.bg,
+        stroke: c.br,
+        strokeWidth: "1.2",
+        strokeDasharray: r.committed ? 'none' : '2 2',
+        opacity: r.committed ? 1 : 0.45
+      }), /*#__PURE__*/React.createElement("text", {
+        x: x0 + 7.5,
+        y: sy + 11.2,
+        textAnchor: "middle",
+        fontSize: "9",
+        fontWeight: "900",
+        fill: c.fg,
+        opacity: r.committed ? 1 : 0.6,
+        pointerEvents: "none"
+      }, r.e.value));
+    }));
+  }), /*#__PURE__*/React.createElement(Msgs, {
+    msgs: T.msgs,
+    pos: ctr,
+    onTip: onTip,
+    look: txnLook,
+    pay: txnPayload(T)
+  }));
+}
+
+/* ================================================================== *
  *  SIDE PANELS                                                        *
  * ================================================================== */
 function NodeRow({
@@ -1913,6 +3377,106 @@ function NodeRow({
       background: node.phase === 'prevote' ? 'var(--pv)' : node.state === 'candidate' ? 'var(--candidate)' : '#3d5aa8'
     }
   })));
+}
+const PHASE_TONE = {
+  idle: '#5a6c99',
+  beginning: 'var(--follower)',
+  preparing: 'var(--pv)',
+  committing: 'var(--leader)',
+  aborting: 'var(--down)',
+  committed: 'var(--leader)',
+  aborted: 'var(--down)'
+};
+
+/* Everything here is derived from the groups' committed logs each frame —
+   there is no transaction state object to fall out of sync with them. */
+function TxnPanel({
+  T,
+  onVote
+}) {
+  const t = T.txn;
+  const phase = txnPhase(T);
+  const c = coordFate(T);
+  const shards = shardsOf(T);
+  const left = t ? Math.max(0, t.deadline - T.clock) : 0;
+  const coord = T.groups[0];
+  return /*#__PURE__*/React.createElement("div", {
+    className: "insp"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "nrow"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "top"
+  }, /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: 'var(--txt)'
+    }
+  }, t ? t.id : 'no transaction'), /*#__PURE__*/React.createElement("span", {
+    className: "pill",
+    style: {
+      background: PHASE_TONE[phase],
+      color: '#08122b'
+    }
+  }, phase), /*#__PURE__*/React.createElement("span", {
+    style: {
+      marginLeft: 'auto',
+      fontSize: 11,
+      color: coord.W.nodes.length === 1 ? 'var(--down)' : 'var(--muted)'
+    }
+  }, coord.W.nodes.length === 1 ? 'coordinator unreplicated' : `coordinator ×${coord.W.nodes.length}`)), /*#__PURE__*/React.createElement("div", {
+    className: "meta"
+  }, /*#__PURE__*/React.createElement("span", null, "BEGIN ", /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: c.begin ? 'var(--leader)' : 'var(--dim)'
+    }
+  }, c.begin ? 'durable' : '—')), /*#__PURE__*/React.createElement("span", null, "decision ", /*#__PURE__*/React.createElement("b", {
+    style: {
+      color: c.decision ? c.decision === 'commit' ? 'var(--leader)' : 'var(--down)' : 'var(--dim)'
+    }
+  }, c.decision ? c.decision.toUpperCase() : 'not recorded'))), t && phase === 'preparing' && /*#__PURE__*/React.createElement("div", {
+    className: "tobar",
+    title: `presumed abort in ${(left / 1000).toFixed(1)}s`
+  }, /*#__PURE__*/React.createElement("i", {
+    style: {
+      width: 100 * left / PREPARE_TIMEOUT + '%',
+      background: 'var(--pv)'
+    }
+  }))), shards.map(g => {
+    const f = shardFate(T, g);
+    const Ld = groupLeader(g);
+    const st = f.applied ? f.applied === 'commit' ? 'applied ✔' : 'applied ✘' : f.vote === 'yes' ? 'PREPARED' : f.vote === 'no' ? 'refused' : 'not asked';
+    const tone = f.applied ? f.applied === 'commit' ? 'var(--leader)' : 'var(--down)' : f.vote === 'yes' ? 'var(--candidate)' : f.vote === 'no' ? 'var(--down)' : '#5a6c99';
+    return /*#__PURE__*/React.createElement("div", {
+      className: "nrow",
+      key: g.id
+    }, /*#__PURE__*/React.createElement("div", {
+      className: "top"
+    }, /*#__PURE__*/React.createElement("b", {
+      style: {
+        color: Ld ? 'var(--txt)' : 'var(--down)'
+      }
+    }, g.name), /*#__PURE__*/React.createElement("span", {
+      className: "pill",
+      style: {
+        background: tone,
+        color: '#08122b'
+      }
+    }, st), f.locked && /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: 'var(--down)',
+        fontWeight: 800,
+        fontSize: 11
+      }
+    }, "\uD83D\uDD12 locked"), /*#__PURE__*/React.createElement("button", {
+      className: "mini",
+      style: {
+        marginLeft: 'auto'
+      },
+      onClick: () => onVote(g.id),
+      title: "what this shard answers when it is asked to prepare"
+    }, "will vote ", g.willVote)), /*#__PURE__*/React.createElement("div", {
+      className: "meta"
+    }, /*#__PURE__*/React.createElement("span", null, "leader ", Ld ? 'N' + Ld.id : 'none'), /*#__PURE__*/React.createElement("span", null, g.W.nodes.length, " node", g.W.nodes.length > 1 ? 's' : ''), /*#__PURE__*/React.createElement("span", null, "quorum ", quorum(g.W.nodes.length))));
+  }));
 }
 function LogRow({
   node,
