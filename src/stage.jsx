@@ -47,11 +47,24 @@ function payloadText(m){
 
 /* Messages in flight. Shared by both stages: the 2PC view passes a scale, its
    own look-up and its own payload formatter, and gets the same trail, halo,
-   glyph and drop animation for free. */
-function Msgs({msgs,pos,onTip,s=1,look=msgLook,pay=payloadText}){
+   glyph and drop animation for free.
+
+   `edge` maps an endpoint id to a radius to keep clear of. Nodes do not need it
+   — they are points on a ring and the message flies between them — but the 2PC
+   view's endpoints are group CENTRES, and a one-node group puts its node
+   exactly there, so without this every Prepare and Decide spawns on top of the
+   coordinator's glyph. Which is the "Coordinator dies — one machine" scenario. */
+function Msgs({msgs,pos,onTip,s=1,look=msgLook,pay=payloadText,edge=null}){
   return msgs.map(m=>{
-    const p=pos[m.from], r=pos[m.to];
+    let p=pos[m.from], r=pos[m.to];
     if(!p||!r) return null;
+    if(edge){
+      const dx=r.x-p.x, dy=r.y-p.y, d=Math.hypot(dx,dy)||1;
+      const a=(edge[m.from]||0)/d, b=(edge[m.to]||0)/d;
+      // Skip it if the two rings already touch — better a message drawn through
+      // a group than one drawn backwards.
+      if(a+b < 0.95){ p={x:p.x+dx*a, y:p.y+dy*a}; r={x:r.x-dx*b, y:r.y-dy*b}; }
+    }
     const t=Math.min(m.progress,1);
     const x=p.x+(r.x-p.x)*t, y=p.y+(r.y-p.y)*t;
     const lk=look(m);

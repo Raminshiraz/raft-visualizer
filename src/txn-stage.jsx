@@ -17,7 +17,7 @@ function txnLayout(T){
   const VW=700, VH=580;
   const S = Math.max(1, T.groups.length-1);
   const SLOT = Math.min(300, 640/S);
-  const out = { VW, VH, groups:[], centres:{} };
+  const out = { VW, VH, groups:[], centres:{}, edge:{} };
 
   for(const g of T.groups){
     const shard = g.role==='shard';
@@ -34,6 +34,7 @@ function txnLayout(T){
     });
     out.groups.push({ g, cx, cy, nr, gr, r:gr+nr+7, s:nr/NODE_R, pos, slot:shard?SLOT:VW });
     out.centres[g.id] = { x:cx, y:cy };
+    out.edge[g.id]    = gr+nr+13;      // the ring, plus room for the message halo
   }
   return out;
 }
@@ -200,9 +201,12 @@ function TxnStage({T,onClick,mode,onTip,onLink,sel}){
         );
       })}
 
-      {/* 2PC RPCs, drawn centre to centre so the endpoint does not jump
-          when a group re-elects mid-flight */}
-      <Msgs msgs={T.msgs} pos={ctr} onTip={onTip} look={txnLook} pay={txnPayload(T)}/>
+      {/* 2PC RPCs, aimed centre to centre so the endpoint does not jump when a
+          group re-elects mid-flight, but held off each group's ring so they
+          leave and land at the edge instead of on top of whatever is drawn
+          there. */}
+      <Msgs msgs={T.msgs} pos={ctr} onTip={onTip} look={txnLook} pay={txnPayload(T)}
+        edge={lay.edge}/>
     </svg>
   );
 }
