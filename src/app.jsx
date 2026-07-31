@@ -217,7 +217,11 @@ function App(){
       (g.role==='coord'&&g.W.nodes.length===1?', and it is a single point of failure again':''),'sys');
   };
 
-  /* Rebuilds groups, so any live transaction goes with them. */
+  /* Rebuilds groups, so any live transaction goes with them. Everything that is
+     not a consequence of the new topology is carried across, because silently
+     undoing the user's damage is worse than refusing to: cuts between groups
+     that still exist survive, and any that pointed at a group that does not
+     are dropped and reported. */
   const rebuild=(coordSize, shardSizes, why)=>{
     resetTxn(T, why);
     const keep = T.groups.map(g=>g.willVote);
@@ -225,6 +229,14 @@ function App(){
     fresh.events = T.events; fresh.nextEid = T.nextEid; fresh.clock = T.clock;
     fresh.txnSeq = T.txnSeq;
     fresh.groups.forEach((g,i)=>{ if(keep[i]) g.willVote = keep[i]; });
+
+    let dropped = 0;
+    for(const k of Object.keys(T.links)){
+      const [a,b] = k.split('-').map(Number);
+      if(a < fresh.groups.length && b < fresh.groups.length) fresh.links[k] = T.links[k];
+      else dropped++;
+    }
+    if(dropped) emitT(fresh,-1,`${dropped} cut link(s) went with the group(s) that were removed`,'sys');
     txnWorld.current = fresh;
     setSel(s=>Math.min(s, fresh.groups.length-1));
     setTxnScenario(null);
