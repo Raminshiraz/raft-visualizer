@@ -117,7 +117,7 @@ function NodeMini({n,x,y,r,onClick,onTip}){
   );
 }
 
-function TxnStage({T,onClick,mode,onTip,onLink,sel}){
+function TxnStage({T,onClick,mode,onTip,onLink,onSelect,sel}){
   const lay = txnLayout(T);
   const ctr = lay.centres;
   const nm  = gid => T.groups[gid] ? T.groups[gid].name : 'group '+gid;
@@ -155,8 +155,20 @@ function TxnStage({T,onClick,mode,onTip,onLink,sel}){
         const ly   = gl.cy - gl.r - 7;
         return (
           <g key={g.id}>
-            <circle cx={gl.cx} cy={gl.cy} r={gl.r} fill={sel===g.id?'#111c40':'#0c1430'}
-              opacity="0.6" stroke={col} strokeWidth={sel===g.id?2.2:1.2} strokeDasharray="7 6"/>
+            {/* Clicking the ring selects the group. Before this the only way to
+                point the side panels at a group without using the toolbar was
+                to click one of its nodes, which also crashed it. */}
+            <circle cx={gl.cx} cy={gl.cy} r={gl.r} style={{cursor:'pointer'}}
+              fill={sel===g.id?'#1a2a5e':'#0c1430'} opacity={sel===g.id?0.85:0.6}
+              stroke={sel===g.id?'#7aa2ff':col} strokeWidth={sel===g.id?2.6:1.2}
+              strokeDasharray="7 6"
+              onClick={e=>{ e.stopPropagation(); onSelect(g.id); }}
+              onMouseEnter={e=>onTip({rows:[
+                ['group',g.name],['nodes',g.W.nodes.length],['quorum',quorum(g.W.nodes.length)],
+                ['leader',Ld?'N'+Ld.id:'none'],['term',term],
+                ['click','inspect this group in the panels'],
+              ],x:e.clientX,y:e.clientY})}
+              onMouseLeave={()=>onTip(null)}/>
             <text x={gl.cx} y={wrap?ly-12:ly} textAnchor="middle" fontSize="11"
               fontWeight="800" fill={col} letterSpacing="1">
               {wrap ? head : `${head} · ${tail}`}

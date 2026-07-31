@@ -424,7 +424,7 @@ function App(){
             <div style={{padding:6}}>
               {isTxn
                 ? <TxnStage T={T} onClick={txnClickNode} mode={mode} onTip={setTip}
-                    onLink={txnClickLink} sel={sel}/>
+                    onLink={txnClickLink} onSelect={setSel} sel={sel}/>
                 : <Stage W={W} onClick={clickNode} mode={mode} onTip={setTip} onLink={clickLink}/>}
             </div>
             <div className="legend">
@@ -451,7 +451,7 @@ function App(){
               </>}
             </div>
             <div className="hint">{isTxn
-              ? <><b style={{color:'var(--muted)'}}>The row of boxes under each group is its 2PC record</b> in that group's own Raft log — solid once a majority stores it, faded dashed until then. Nothing is ever said out loud before its box goes solid, which is the whole difference between this and textbook 2PC. Click the wire between two groups to cut them apart, click any node to crash it, and hover anything for detail.</>
+              ? <><b style={{color:'var(--muted)'}}>The row of boxes under each group is its 2PC record</b> in that group's own Raft log — solid once a majority stores it, faded dashed until then. Nothing is ever said out loud before its box goes solid, which is the whole difference between this and textbook 2PC. Click the wire between two groups to cut them apart, click a group's ring to point the panels at it, click any node to crash it, and hover anything for detail.</>
               : <><b style={{color:'var(--muted)'}}>Click a wire</b> between two nodes to cycle it: healthy → fully cut → one-way → the other one-way → healthy. A one-way cut lets a node send but never receive — that is how a node becomes unreachable to only <i>some</i> peers without being offline. Ring around each node = its election-timeout countdown on a shared scale. Hover any flying message for its RPC payload.</>}
             </div>
           </div>
