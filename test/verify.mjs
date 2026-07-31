@@ -8,11 +8,35 @@
  */
 import fs from 'node:fs';
 import vm from 'node:vm';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 let code = fs.readFileSync(path.join(here, '..', 'app.js'), 'utf8');
+
+/* app.js is the committed build of src/, and CI runs only this suite -- it
+ * never rebuilds. So check first that the two agree: editing src/ and
+ * forgetting to build would otherwise test, pass and deploy the OLD engine.
+ * Same sorted-content hash build.mjs stamps in; node:crypto is builtin, so
+ * this stays dependency-free. Newlines are normalised because core.autocrlf
+ * rewrites the working tree on checkout, and hashing raw bytes would then
+ * fail on a perfectly clean Windows clone. */
+{
+  const dir = path.join(here, '..', 'src');
+  const h = crypto.createHash('sha256');
+  for (const name of fs.readdirSync(dir).filter(f => f.endsWith('.jsx')).sort())
+    h.update(name).update('\0')
+     .update(fs.readFileSync(path.join(dir, name), 'utf8').replace(/\r\n/g, '\n'))
+     .update('\0');
+  const want = h.digest('hex').slice(0, 16);
+  const got = (code.match(/src-fingerprint: ([0-9a-f]+)/) || [])[1];
+  if (got !== want) {
+    console.error(`app.js is STALE — built from src-fingerprint ${got || '(none)'}, but src/ is now ${want}.`);
+    console.error('Run `npm run build` and commit app.js together with your src/ changes.');
+    process.exit(1);
+  }
+}
 code += '\n;globalThis.__X={makeWorld,tick,SCENARIOS,quorum,broadcastAppendEntries,linkKey,LINK_CYCLE,'
       + 'makeTxnWorld,tickTxn,beginTxn,txnPhase,shardFate,coordFate,groupLeader,committedOn,TXN_SCENARIOS};';
 

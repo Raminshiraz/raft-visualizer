@@ -212,11 +212,11 @@ To run the safety suite (no dependencies needed):
 npm test
 ```
 
-To edit the simulation, change `app.jsx` and rebuild:
+To edit the simulation, change a file in `src/` and rebuild:
 
 ```bash
 npm install
-npm run build      # app.jsx -> app.js
+npm run build      # src/*.jsx -> app.js
 ```
 
 `app.js` is committed so a bare checkout and GitHub Pages both work with no build step. React and ReactDOM are vendored in `vendor/` (~140 KB total) so the page has no network dependency at all.
@@ -224,15 +224,29 @@ npm run build      # app.jsx -> app.js
 ### Layout
 
 ```
-index.html        page shell, styles, library-load diagnostics
-app.jsx           source: Raft engine + React UI
-app.js            compiled output (committed)
-build.mjs         app.jsx -> app.js
-test/verify.mjs   headless safety-invariant suite
-vendor/           React 18 UMD builds
+index.html            page shell, styles, library-load diagnostics
+src/                  source, split by concern:
+  constants.jsx         timings, node model, log helpers, colour scales
+  raft-engine.jsx       elections, replication, RPC delivery, tick
+  raft-scenarios.jsx    makeWorld, membership, SCENARIOS
+  txn-engine.jsx        two-phase commit over the engine above
+  txn-scenarios.jsx     TXN_SCENARIOS
+  layout.jsx            single-cluster ring geometry
+  explain.jsx           live narration for both views
+  app.jsx               root component, controls, page layout
+  stage.jsx             cluster SVG + drawing shared with the 2PC stage
+  txn-stage.jsx         2PC SVG: groups, small nodes, cross-group RPCs
+  panels.jsx            side panels and the tooltip
+  mount.jsx             renders <App/> — always concatenated last
+app.js                compiled output (committed)
+build.mjs             src/*.jsx -> app.js, and the file order
+test/verify.mjs       headless safety-invariant suite
+vendor/               React 18 UMD builds
 ```
 
-The Raft engine is plain functions over a mutable world object and has no React dependency — that is what lets the test suite drive it headlessly. The 2PC layer sits in the same file, above the UI and equally React-free: it is plain functions over a transaction world that holds one Raft world per group, so the same suite drives both. There are no new files and no new dependencies.
+**The files in `src/` are fragments of one classic script, not modules.** They share a single top-level scope and contain no `import` or `export`; `build.mjs` compiles each with Babel's JSX transform and concatenates them in the order listed in its `SOURCES` array, which is the dependency order. That is deliberate: `index.html` loads `app.js` with a plain `<script>` tag, and ES modules are blocked by CORS over `file://`. Splitting into real modules — or reaching for a bundler — would cost the "just open `index.html`" promise, which is the point of the repo. `build.mjs` fails the build if a `src/` file grows an `import`.
+
+The Raft engine is plain functions over a mutable world object and has no React dependency — that is what lets the test suite drive it headlessly. The 2PC layer sits directly on top of it, and is equally React-free: it is plain functions over a transaction world that holds one Raft world per group, so the same suite drives both. There are no new files and no new dependencies.
 
 ---
 
