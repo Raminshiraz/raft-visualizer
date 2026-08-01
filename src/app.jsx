@@ -575,10 +575,10 @@ const L = ({c,t})=>(<span className="it"><span className="dot" style={{backgroun
    already at its limit greys out the side that cannot move. */
 const Stepper = ({label,value,onAdd,onSub,addDisabled,subDisabled,addTitle})=>(
   <span className="step">
-    <button className="btn" onClick={onAdd} disabled={addDisabled}
-      title={addTitle||('add one — '+label.toLowerCase())} aria-label={'add one '+label}>+</button>
-    <span className="stepv">{label} <b>{value}</b></span>
     <button className="btn" onClick={onSub} disabled={subDisabled}
       title={'remove one — '+label.toLowerCase()} aria-label={'remove one '+label}>−</button>
+    <span className="stepv">{label} <b>{value}</b></span>
+    <button className="btn" onClick={onAdd} disabled={addDisabled}
+      title={addTitle||('add one — '+label.toLowerCase())} aria-label={'add one '+label}>+</button>
   </span>
 );
