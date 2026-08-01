@@ -75,7 +75,7 @@ function emitT(T, gid, text, kind){
   if(T.events.length>160) T.events.length=160;
 }
 
-const groupLeader = g => g.W.nodes.find(n=>n.state==='leader');
+const groupLeader = g => currentLeader(g.W.nodes);
 const shardsOf    = T => T.groups.filter(g=>g.role==='shard');
 
 /* ------------------------------------------------------------------ *

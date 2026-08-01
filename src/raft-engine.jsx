@@ -13,6 +13,23 @@
 const byId   = (W,id)=> W.nodes.find(n=>n.id===id);
 const nodeCount = W => W.nodes.length;
 
+/* The leader, when more than one node still calls itself one.
+   A leader that is deposed while it cannot hear anybody keeps believing it is
+   the leader until something carrying a newer term reaches it, so during a
+   partition or a one-way cut two nodes are legitimately in 'leader' state at
+   the same time. That is Raft working, not a bug — Election Safety is one
+   leader per TERM, not one leader at a time.
+   Array order says nothing about which of them is current; the term does.
+   Picking by position means naming the deposed one about half the time, and
+   handing it client commands it can only append to a log that will be
+   truncated out from under them. */
+function currentLeader(nodes){
+  let best = null;
+  for(const n of nodes)
+    if(n.state==='leader' && (!best || n.currentTerm > best.currentTerm)) best = n;
+  return best;
+}
+
 function emit(W, nodeId, text, kind){
   W.events.unshift({ id:W.nextEid++, t:(W.clock/1000).toFixed(1), nodeId, text, kind:kind||'' });
   if(W.events.length>160) W.events.length=160;

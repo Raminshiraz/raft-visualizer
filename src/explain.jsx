@@ -8,7 +8,7 @@
 function explain(W){
   const N = W.nodes.length, q = quorum(N);
   const live = W.nodes.filter(n=>n.state!=='down');
-  const leader = W.nodes.find(n=>n.state==='leader');
+  const leader = currentLeader(W.nodes);
   const cands  = W.nodes.filter(n=>n.state==='candidate');
   const pre    = W.nodes.filter(n=>n.phase==='prevote');
   const parts  = new Set(W.nodes.map(n=>n.partition));
