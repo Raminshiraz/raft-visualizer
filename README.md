@@ -182,7 +182,7 @@ One row deserves reading carefully. `links + partitions + crashes + loss` report
 Honest list of where this departs from a production Raft:
 
 - **No log compaction / snapshots.** Logs grow forever.
-- **No cluster membership changes.** Adding a node takes effect immediately, with no joint consensus. Do not read the add/remove buttons as a model of reconfiguration.
+- **No cluster membership changes.** Adding a node takes effect immediately, with no joint consensus and no catch-up phase — a new node is a full voter with an empty log from the moment it appears. Do not read the add/remove buttons as a model of reconfiguration. The `Nodes` stepper is disabled while any node is down, because resizing around a node that is behind can genuinely destroy a committed entry: `−` pops by position regardless of what that node holds, and enough empty voters form a majority that no up-to-date check can veto.
 - **No persistence layer.** "Persistent" state survives a simulated crash because it lives in the same object; there is no fsync to model.
 - **`AppendEntries` sends the whole tail** from `nextIndex` onward rather than a bounded batch. Correct, just not what you would ship.
 - **Simulated time.** One virtual clock, no real concurrency, so there are no genuine races — message interleaving is driven by latency jitter instead.

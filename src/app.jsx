@@ -136,14 +136,37 @@ function App(){
     emit(W,-1,'network healed — all partitions merged and every link restored','sys');
   };
 
+  /* Resizing the cluster is instantaneous and unlogged — there is no joint
+     consensus here, and the README says so. That stays harmless while every
+     node is up, because one node either way keeps the old and new majorities
+     overlapping and the leader replicates into a new node long before it
+     could matter. It stops being harmless the moment one is DOWN:
+
+       - a crashed node does not catch up, so it stays behind;
+       - removeNodeFrom pops by array position, indifferent to what the node
+         it pops is holding;
+       - addNodeTo makes the new node a full voter with an EMPTY log at once,
+         with no catch-up phase (thesis §4.2.1).
+
+     Chain a few of those and a majority of empty logs elects a leader that
+     has never seen a committed entry — the up-to-date check cannot save you
+     when the majority genuinely holds nothing. Measured: committed entries
+     were destroyed in about 1% of 90-second sessions that mixed this stepper
+     with crash/restart, and in 0 of 200 that used the stepper alone.
+
+     Modelling reconfiguration properly is a different project. Refusing to
+     resize while anyone is down closes the path and is a rule you can say
+     out loud, which is what the disabled tooltip does. */
+  const anyDown = W.nodes.some(n=>n.state==='down');
+
   const addNode=()=>{
-    if(W.nodes.length>=9) return;
+    if(W.nodes.length>=9 || anyDown) return;
     const t=Math.max(0,...W.nodes.map(n=>n.currentTerm));
     const n=addNodeTo(W,t);
     emit(W,n.id,`joins the cluster — quorum is now ${quorum(W.nodes.length)}/${W.nodes.length}`,'sys');
   };
   const removeNode=()=>{
-    if(W.nodes.length<=3) return;
+    if(W.nodes.length<=3 || anyDown) return;
     const n=removeNodeFrom(W);
     emit(W,n.id,`removed — quorum is now ${quorum(W.nodes.length)}/${W.nodes.length}`,'sys');
   };
@@ -357,8 +380,9 @@ function App(){
           <button className="btn" onClick={healAll}>Heal network</button>
           <div className="sep"/>
           <Stepper label="Nodes" value={W.nodes.length} onAdd={addNode} onSub={removeNode}
-            addDisabled={W.nodes.length>=9} subDisabled={W.nodes.length<=3}
-            addTitle="add a node — quorum grows with the cluster"/>
+            addDisabled={W.nodes.length>=9||anyDown} subDisabled={W.nodes.length<=3||anyDown}
+            addTitle={anyDown?RESIZE_BLOCKED:'add a node — quorum grows with the cluster'}
+            subTitle={anyDown?RESIZE_BLOCKED:'remove a node — quorum shrinks with the cluster'}/>
           <div className="sep"/>
           <button className="btn primary" onClick={clientCmd}>Client command</button>
         </div>}
@@ -573,10 +597,14 @@ const L = ({c,t})=>(<span className="it"><span className="dot" style={{backgroun
 /* One control instead of two loose buttons: the count sits between + and -,
    so what the buttons act on is named where they are, and a topology that is
    already at its limit greys out the side that cannot move. */
-const Stepper = ({label,value,onAdd,onSub,addDisabled,subDisabled,addTitle})=>(
+const RESIZE_BLOCKED =
+  'restart every crashed node first — resizing while one is down is not modelled '
+  + 'safely here (no joint consensus), and it can lose a committed entry';
+
+const Stepper = ({label,value,onAdd,onSub,addDisabled,subDisabled,addTitle,subTitle})=>(
   <span className="step">
     <button className="btn" onClick={onSub} disabled={subDisabled}
-      title={'remove one — '+label.toLowerCase()} aria-label={'remove one '+label}>−</button>
+      title={subTitle||('remove one — '+label.toLowerCase())} aria-label={'remove one '+label}>−</button>
     <span className="stepv">{label} <b>{value}</b></span>
     <button className="btn" onClick={onAdd} disabled={addDisabled}
       title={addTitle||('add one — '+label.toLowerCase())} aria-label={'add one '+label}>+</button>
