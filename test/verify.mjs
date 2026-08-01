@@ -5,6 +5,8 @@
  * the four safety properties from the Raft paper after every 40ms tick.
  *
  *   run with:  npm test
+ *              npm test -- --seeds=200      widen the sweep
+ *              npm test -- --seed=1234      replay one seed, every row
  */
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -40,7 +42,47 @@ let code = fs.readFileSync(path.join(here, '..', 'app.js'), 'utf8');
 code += '\n;globalThis.__X={makeWorld,tick,SCENARIOS,quorum,broadcastAppendEntries,linkKey,LINK_CYCLE,'
       + 'makeTxnWorld,tickTxn,beginTxn,txnPhase,shardFate,coordFate,groupLeader,committedOn,sendTxn,TXN_SCENARIOS};';
 
+/* ------------------------------------------------------------------ *
+ *  Seeded randomness                                                  *
+ *                                                                     *
+ *  Every chaos row used to be ONE sample against a live Math.random:  *
+ *  a rare safety bug passed CI most of the time, and on the run where *
+ *  it did not there was nothing to reproduce it with. Both ends of    *
+ *  the randomness -- the engine's Math.random inside the sandbox, and *
+ *  the chaos functions out here -- now draw from this one generator,  *
+ *  so a run is completely determined by its seed, and every row       *
+ *  sweeps many seeds instead of one. A failure prints the seed that   *
+ *  produced it; `npm test -- --seed=N` replays it exactly.            *
+ * ------------------------------------------------------------------ */
+const arg = (k, d) => {
+  const hit = process.argv.slice(2).find(a => a.startsWith(`--${k}=`));
+  return hit === undefined ? d : Number(hit.split('=')[1]);
+};
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+let rng = mulberry32(1);
+const rand = () => rng();
+const reseed = s => { rng = mulberry32(s); };
+
+/* One pinned seed replays a single scenario across every row; otherwise each
+   row sweeps 1..SEEDS. Kept modest by default so `npm test` still lands in a
+   couple of seconds -- widen it with --seeds when hunting something rare. */
+const PINNED = arg('seed', null);
+const SEEDS  = PINNED !== null ? [PINNED]
+             : Array.from({ length: arg('seeds', 50) }, (_, i) => i + 1);
+const NSEED  = String(SEEDS.length).padStart(3) + (SEEDS.length === 1 ? ' seed ' : ' seeds');
+
 // Minimal DOM/React stubs — we only exercise the simulation core.
+// Math is shadowed so the engine's own randomness is seeded too; everything
+// else on it is inherited unchanged.
+const seededMath = Object.create(Math);
+seededMath.random = rand;
 const sandbox = {
   React: { useState: () => [0, () => {}], useRef: () => ({ current: null }),
            useEffect: () => {}, useCallback: f => f, createElement: () => ({}) },
@@ -48,7 +90,7 @@ const sandbox = {
   document: { getElementById: () => ({}) },
   performance: { now: () => 0 },
   requestAnimationFrame: () => 0, cancelAnimationFrame: () => {},
-  window: {}, console,
+  window: {}, console, Math: seededMath,
 };
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox);
@@ -103,25 +145,38 @@ function check(W, S, viol) {
  * ------------------------------------------------------------------ */
 let failures = 0;
 
+/* One row = the same scenario replayed across every seed. It stops at the
+   first seed that breaks an invariant, because after that the interesting
+   output is the repro, not how many more seeds also fail. */
 function run(name, build, ms, chaos) {
-  const W = build();
-  const S = { leaderOfTerm: new Map(), committed: new Map() };
-  const viol = [];
-  let t = 0, everLed = false, commits = 0;
+  let everLed = false, commits = 0, bad = null;
 
-  while (t < ms) {
-    X.tick(W, 40); t += 40;
-    if (chaos) chaos(W, t);
-    check(W, S, viol);
-    if (W.nodes.some(n => n.state === 'leader')) everLed = true;
-    commits = Math.max(commits, ...W.nodes.map(n => n.commitIndex));
-    if (viol.length) break;
+  for (const seed of SEEDS) {
+    reseed(seed);
+    const W = build();
+    const S = { leaderOfTerm: new Map(), committed: new Map() };
+    const viol = [];
+    let t = 0;
+
+    while (t < ms) {
+      X.tick(W, 40); t += 40;
+      if (chaos) chaos(W, t);
+      check(W, S, viol);
+      if (W.nodes.some(n => n.state === 'leader')) everLed = true;
+      commits = Math.max(commits, ...W.nodes.map(n => n.commitIndex));
+      if (viol.length) break;
+    }
+    if (viol.length) { bad = { seed, viol }; break; }
   }
 
-  const ok = viol.length === 0;
+  const ok = bad === null;
   if (!ok) failures++;
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(36)} leader=${everLed ? 'y' : 'n'}  maxCommit=${commits}`);
-  viol.slice(0, 3).forEach(v => console.log('        ! ' + v));
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(36)} ${NSEED}  ` +
+    `leader=${everLed ? 'y' : 'n'}  maxCommit=${commits}`);
+  if (bad) {
+    console.log(`        ! seed ${bad.seed} — replay with:  npm test -- --seed=${bad.seed}`);
+    bad.viol.slice(0, 3).forEach(v => console.log('        ! ' + v));
+  }
   return ok;
 }
 
@@ -137,8 +192,8 @@ const write = (W, tag) => {
 
 /** Advance one random link through its cut/one-way/healthy cycle. */
 const flipLink = (W, n) => {
-  const a = Math.floor(Math.random() * n);
-  let b = Math.floor(Math.random() * n); if (b === a) b = (b + 1) % n;
+  const a = Math.floor(rand() * n);
+  let b = Math.floor(rand() * n); if (b === a) b = (b + 1) % n;
   const k = X.linkKey(a, b), next = X.LINK_CYCLE[W.links[k]];
   if (next === undefined) delete W.links[k]; else W.links[k] = next;
 };
@@ -150,8 +205,8 @@ run('healthy cluster + client writes', () => X.makeWorld(5, cfg()), 40000,
 
 run('random crash / restart', () => X.makeWorld(5, cfg({ jitter: 0.4 })), 60000, (W, t) => {
   if (t % 1200 === 0) {
-    const n = W.nodes[Math.floor(Math.random() * W.nodes.length)];
-    if (n.state === 'down') { n.state = 'follower'; n.timeout = 3000 + Math.random() * 3000; n.lastHeard = 6000; }
+    const n = W.nodes[Math.floor(rand() * W.nodes.length)];
+    if (n.state === 'down') { n.state = 'follower'; n.timeout = 3000 + rand() * 3000; n.lastHeard = 6000; }
     else if (W.nodes.filter(x => x.state !== 'down').length > 3) n.state = 'down';
   }
   if (t % 900 === 0) write(W, 'c');
@@ -159,7 +214,7 @@ run('random crash / restart', () => X.makeWorld(5, cfg({ jitter: 0.4 })), 60000,
 
 run('flapping network partitions', () => X.makeWorld(5, cfg({ jitter: 0.3 })), 60000, (W, t) => {
   if (t % 6000 === 0) {
-    const k = Math.floor(Math.random() * 3);
+    const k = Math.floor(rand() * 3);
     W.nodes.forEach((n, i) => n.partition = i < 5 - k ? 0 : 1);
   }
   if (t % 1000 === 0) write(W, 'p');
@@ -178,10 +233,10 @@ run('random link cuts (incl. one-way)', () => X.makeWorld(5, cfg({ jitter: 0.3 }
 // progress rather than risk split brain.
 run('links + partitions + crashes + loss', () => X.makeWorld(7, cfg({ dropRate: 0.2, jitter: 0.5 })), 80000, (W, t) => {
   if (t % 1800 === 0) flipLink(W, 7);
-  if (t % 5000 === 0) W.nodes.forEach(n => n.partition = Math.random() < 0.3 ? 1 : 0);
+  if (t % 5000 === 0) W.nodes.forEach(n => n.partition = rand() < 0.3 ? 1 : 0);
   if (t % 3000 === 0) {
-    const n = W.nodes[Math.floor(Math.random() * 7)];
-    if (n.state === 'down') { n.state = 'follower'; n.timeout = 3000 + Math.random() * 3000; n.lastHeard = 6000; }
+    const n = W.nodes[Math.floor(rand() * 7)];
+    if (n.state === 'down') { n.state = 'follower'; n.timeout = 3000 + rand() * 3000; n.lastHeard = 6000; }
     else if (W.nodes.filter(x => x.state !== 'down').length > 4) n.state = 'down';
   }
   if (t % 1100 === 0) write(W, 'x');
@@ -204,8 +259,8 @@ for (const key of Object.keys(X.SCENARIOS))
 run('prevote + links + crashes + loss', () => X.makeWorld(5, cfg({ prevote: true, dropRate: 0.2, jitter: 0.5 })), 80000, (W, t) => {
   if (t % 1800 === 0) flipLink(W, 5);
   if (t % 3000 === 0) {
-    const n = W.nodes[Math.floor(Math.random() * 5)];
-    if (n.state === 'down') { n.state = 'follower'; n.timeout = 3000 + Math.random() * 3000; n.lastHeard = 6000; }
+    const n = W.nodes[Math.floor(rand() * 5)];
+    if (n.state === 'down') { n.state = 'follower'; n.timeout = 3000 + rand() * 3000; n.lastHeard = 6000; }
     else if (W.nodes.filter(x => x.state !== 'down').length > 3) n.state = 'down';
   }
   if (t % 1100 === 0) write(W, 'q');
@@ -215,27 +270,43 @@ run('prevote + links + crashes + loss', () => X.makeWorld(5, cfg({ prevote: true
  *  PreVote — the whole point is that a node the leader cannot reach    *
  *  must not be able to depose it. Assert that directly.                *
  * ------------------------------------------------------------------ */
+/* Swept over every seed, which also fixes a blind spot: the victim is picked by
+   id, so whether 'lo2hi' starves it or merely muffles its replies depends on
+   which node happened to win. On one sample half these rows could be tautology;
+   over a sweep both orientations are covered. */
 function preVoteHoldsLeader(name, cutState, prevote, expectDisruption) {
-  const W = X.makeWorld(5, cfg({ prevote }));
-  let t = 0, L = null, baseTerm = 0, victim = null, deposed = false, maxTerm = 0;
-  while (t < 60000) {
-    X.tick(W, 40); t += 40;
-    const cur = W.nodes.find(n => n.state === 'leader');
-    if (!L && cur) {                       // once a leader exists, cut one wire
-      L = cur; baseTerm = cur.currentTerm;
-      victim = W.nodes.find(n => n.id !== L.id);
-      W.links[X.linkKey(L.id, victim.id)] = cutState;
+  let disruptedCount = 0, firstBad = null, termLo = Infinity, termHi = 0;
+
+  for (const seed of SEEDS) {
+    reseed(seed);
+    const W = X.makeWorld(5, cfg({ prevote }));
+    let t = 0, L = null, baseTerm = 0, victim = null, deposed = false, maxTerm = 0;
+    while (t < 60000) {
+      X.tick(W, 40); t += 40;
+      const cur = W.nodes.find(n => n.state === 'leader');
+      if (!L && cur) {                       // once a leader exists, cut one wire
+        L = cur; baseTerm = cur.currentTerm;
+        victim = W.nodes.find(n => n.id !== L.id);
+        W.links[X.linkKey(L.id, victim.id)] = cutState;
+      }
+      if (L) {
+        if (cur && cur.id !== L.id) deposed = true;
+        maxTerm = Math.max(maxTerm, ...W.nodes.map(n => n.currentTerm));
+      }
     }
-    if (L) {
-      if (cur && cur.id !== L.id) deposed = true;
-      maxTerm = Math.max(maxTerm, ...W.nodes.map(n => n.currentTerm));
-    }
+    const disrupted = deposed || maxTerm > baseTerm;
+    if (disrupted) disruptedCount++;
+    if (disrupted !== expectDisruption && firstBad === null) firstBad = seed;
+    termLo = Math.min(termLo, baseTerm); termHi = Math.max(termHi, maxTerm);
   }
-  const disrupted = deposed || maxTerm > baseTerm;
-  const ok = disrupted === expectDisruption;
+
+  const ok = firstBad === null;
   if (!ok) failures++;
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(36)} term ${baseTerm}->${maxTerm}  ` +
-    `leader ${deposed ? 'DEPOSED' : 'held'}  (expected ${expectDisruption ? 'disruption' : 'no disruption'})`);
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(36)} ${NSEED}  ` +
+    `disrupted ${disruptedCount}/${SEEDS.length}  term ${termLo}->${termHi}  ` +
+    `(expected ${expectDisruption ? 'disruption' : 'no disruption'} every time)`);
+  if (firstBad !== null)
+    console.log(`        ! seed ${firstBad} — replay with:  npm test -- --seed=${firstBad}`);
 }
 
 // Both directions dead, and each one-way direction, must all be survivable.
@@ -247,29 +318,44 @@ preVoteHoldsLeader('no prevote: same cut disrupts', 'cut', false, true);
 
 // A node that can send but never receive must not raise the cluster's term.
 {
-  const W = X.makeWorld(5, cfg({ prevote: true }));
-  for (let j = 0; j < 4; j++) W.links[X.linkKey(j, 4)] = 'lo2hi';
-  let t = 0;
-  while (t < 60000) { X.tick(W, 40); t += 40; }
-  const disruptor = W.nodes[4];
-  const others = W.nodes.slice(0, 4).map(n => n.currentTerm);
-  const ok = disruptor.currentTerm <= Math.max(...others) && disruptor.state !== 'leader';
+  let firstBad = null, worstTerm = 0, sample = '';
+  for (const seed of SEEDS) {
+    reseed(seed);
+    const W = X.makeWorld(5, cfg({ prevote: true }));
+    for (let j = 0; j < 4; j++) W.links[X.linkKey(j, 4)] = 'lo2hi';
+    let t = 0;
+    while (t < 60000) { X.tick(W, 40); t += 40; }
+    const disruptor = W.nodes[4];
+    const others = W.nodes.slice(0, 4).map(n => n.currentTerm);
+    worstTerm = Math.max(worstTerm, disruptor.currentTerm);
+    sample = `N4 term=${disruptor.currentTerm} state=${disruptor.state}  cluster terms=[${others}]`;
+    if ((disruptor.currentTerm > Math.max(...others) || disruptor.state === 'leader') && firstBad === null)
+      firstBad = seed;
+  }
+  const ok = firstBad === null;
   if (!ok) failures++;
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${'prevote: disruptor stays quiet'.padEnd(36)} ` +
-    `N4 term=${disruptor.currentTerm} state=${disruptor.state}  cluster terms=[${others}]`);
+    `${NSEED}  worst N4 term=${worstTerm}  last: ${sample}`);
+  if (firstBad !== null)
+    console.log(`        ! seed ${firstBad} — replay with:  npm test -- --seed=${firstBad}`);
 }
 
 // PreVote must not cost liveness. It legitimately costs one extra round trip
 // (probe + reply) before the real election starts, so compare the median
 // against the same cluster with PreVote off rather than against a constant.
+/* Fixed 1..60 rather than SEEDS: this row is a distribution, not a search, so
+   it wants a stable sample both --seeds and --seed leave alone. Comparing two
+   medians drawn from the SAME seeds also cancels most of the sampling noise. */
 {
   const recover = (prevote) => {
     const times = [];
-    for (let i = 0; i < 60; i++) {
+    for (let i = 1; i <= 60; i++) {
+      reseed(i);
       const W = X.makeWorld(5, cfg({ prevote }));
       let t = 0;
       while (t < 30000 && !W.nodes.some(n => n.state === 'leader')) { X.tick(W, 40); t += 40; }
       const L = W.nodes.find(n => n.state === 'leader');
+      if (!L) { times.push(Infinity); continue; }   // never elected: not a recovery sample
       L.state = 'down';
       let e = 0;
       while (e < 60000 && !W.nodes.some(n => n.state === 'leader' && n.id !== L.id)) { X.tick(W, 40); e += 40; }
@@ -289,15 +375,19 @@ preVoteHoldsLeader('no prevote: same cut disrupts', 'cut', false, true);
 }
 
 // Liveness: a healthy cluster must elect promptly, every time.
-let slow = 0;
-for (let i = 0; i < 40; i++) {
+let slow = 0, slowSeed = null;
+for (const seed of SEEDS) {
+  reseed(seed);
   const W = X.makeWorld(5, cfg());
   let t = 0;
   while (t < 30000 && !W.nodes.some(n => n.state === 'leader')) { X.tick(W, 40); t += 40; }
-  if (t > 15000) slow++;
+  if (t > 15000) { slow++; if (slowSeed === null) slowSeed = seed; }
 }
 if (slow) failures++;
-console.log(`${slow ? 'FAIL' : 'PASS'}  ${'liveness: 40 cold starts'.padEnd(36)} slow(>15s)=${slow}`);
+console.log(`${slow ? 'FAIL' : 'PASS'}  ${'liveness: cold starts'.padEnd(36)} ` +
+  `${NSEED}  slow(>15s)=${slow}`);
+if (slowSeed !== null)
+  console.log(`        ! seed ${slowSeed} — replay with:  npm test -- --seed=${slowSeed}`);
 
 /* ------------------------------------------------------------------ *
  *  Two-phase commit over Raft                                          *
@@ -357,30 +447,54 @@ function checkTxn(T, S, viol) {
     }
 }
 
-function runTxn(name, build, ms, chaos, verdict) {
-  const T = build();
-  const S = { raft: {}, decision: {} };
-  const viol = [];
-  let t = 0;
+/* Invariants are absolute: one violating seed fails the row and prints the
+   repro. The OUTCOME verdicts are not, and pretending otherwise would just
+   make CI flaky. "Shard leader dies after PREPARED" races the prepare
+   deadline by design -- the PREPARE_TIMEOUT note in txn-engine.jsx measures
+   0.3% of runs aborting instead of committing at 35s, and that is a property
+   of 2PC on a deadline, not a defect. So the verdict is scored as a rate with
+   a floor well above the measured tail, which still catches any regression
+   that turns a reliable commit into a coin flip. */
+const VERDICT_FLOOR = 0.9;
 
-  while (t < ms) {
-    X.tickTxn(T, 40); t += 40;
-    if (chaos) chaos(T, t);
-    checkTxn(T, S, viol);
-    if (viol.length) break;
+function runTxn(name, build, ms, chaos, verdict) {
+  let bad = null, met = 0, lastText = '';
+
+  for (const seed of SEEDS) {
+    reseed(seed);
+    const T = build();
+    const S = { raft: {}, decision: {} };
+    const viol = [];
+    let t = 0;
+
+    while (t < ms) {
+      X.tickTxn(T, 40); t += 40;
+      if (chaos) chaos(T, t);
+      checkTxn(T, S, viol);
+      if (viol.length) break;
+    }
+    if (viol.length) { bad = { seed, viol }; break; }
+
+    const fates = shardsOf(T).map(g => X.shardFate(T, g));
+    const info = {
+      T, phase: X.txnPhase(T), shards: fates.length,
+      locked: fates.filter(f => f.locked).length,
+      applied: fates.filter(f => f.applied).length,
+    };
+    const v = verdict ? verdict(info) : { ok: true, text: '' };
+    if (v.ok) met++;
+    lastText = v.text;
   }
 
-  const fates = shardsOf(T).map(g => X.shardFate(T, g));
-  const info = {
-    T, phase: X.txnPhase(T), shards: fates.length,
-    locked: fates.filter(f => f.locked).length,
-    applied: fates.filter(f => f.applied).length,
-  };
-  const v = verdict ? verdict(info) : { ok: true, text: '' };
-  const ok = viol.length === 0 && v.ok;
+  const rate = met / SEEDS.length;
+  const ok = bad === null && rate >= VERDICT_FLOOR;
   if (!ok) failures++;
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(36)} ${v.text}`);
-  viol.slice(0, 3).forEach(v2 => console.log('        ! ' + v2));
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name.padEnd(36)} ${NSEED}  ` +
+    `verdict ${met}/${SEEDS.length}  ${lastText}`);
+  if (bad) {
+    console.log(`        ! seed ${bad.seed} — replay with:  npm test -- --seed=${bad.seed}`);
+    bad.viol.slice(0, 3).forEach(v2 => console.log('        ! ' + v2));
+  }
   return ok;
 }
 
@@ -520,18 +634,18 @@ runTxn('2pc: atomicity under chaos', () => buildTxn(3, [3, 3, 3], { dropRate: 0.
   (T, t) => {
     if (t % 20000 === 2000) X.beginTxn(T);
     if (t % 3000 === 0) {
-      const g = T.groups[Math.floor(Math.random() * T.groups.length)];
-      const n = g.W.nodes[Math.floor(Math.random() * g.W.nodes.length)];
+      const g = T.groups[Math.floor(rand() * T.groups.length)];
+      const n = g.W.nodes[Math.floor(rand() * g.W.nodes.length)];
       if (n.state === 'down') { n.state = 'follower'; n.lastHeard = 6000; }
       else if (g.W.nodes.filter(x => x.state !== 'down').length > 2) n.state = 'down';
     }
     if (t % 5000 === 0) {
-      const b = 1 + Math.floor(Math.random() * (T.groups.length - 1));
+      const b = 1 + Math.floor(rand() * (T.groups.length - 1));
       const k = X.linkKey(0, b), next = X.LINK_CYCLE[T.links[k]];
       if (next === undefined) delete T.links[k]; else T.links[k] = next;
     }
     if (t % 7000 === 0) {
-      const g = T.groups[1 + Math.floor(Math.random() * (T.groups.length - 1))];
+      const g = T.groups[1 + Math.floor(rand() * (T.groups.length - 1))];
       g.partition = g.partition ? 0 : 1;
     }
   },
