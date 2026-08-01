@@ -317,7 +317,7 @@ function App(){
             <span className="chip">locks held <b style={{color:nLocks?'var(--down)':'var(--leader)'}}>{nLocks}</b></span>
           </> : <>
             <span className="chip">term <b>{maxTerm}</b></span>
-            <span className="chip">quorum <b>{q}</b>/<b>{W.nodes.length}</b></span>
+            <span className="chip">quorum <b>{q}/{W.nodes.length}</b></span>
             <span className="chip">alive <b style={{color:live>=q?'var(--leader)':'var(--down)'}}>{live}</b></span>
             <span className="chip">leader <b style={{color:leader?'var(--leader)':'var(--down)'}}>{leader?'N'+leader.id:'none'}</b></span>
           </>}
@@ -346,7 +346,7 @@ function App(){
             onChange={e=>{const v=parseFloat(e.target.value); ui.current.speed=v; setSpeed(v);}}/>
           <b>{speed}×</b></div>
         <div className="sep"/>
-        <button className="btn warn" onClick={restart}>↺\uFE0E  Restart {isTxn&&!txnScenario?'view':'scenario'}</button>
+        <button className="btn warn" onClick={restart}>↺ Restart {isTxn&&!txnScenario?'view':'scenario'}</button>
       </div>
 
       {!isTxn &&
