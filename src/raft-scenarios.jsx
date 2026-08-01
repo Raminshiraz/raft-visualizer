@@ -57,7 +57,7 @@ const SCENARIOS = {
     build(cfg){
       const W = makeWorld(5,cfg);
       W.armed = (W)=>{
-        const L = W.nodes.find(n=>n.state==='leader');
+        const L = currentLeader(W.nodes);
         if(!L) return false;
         L.state='down';
         emit(W, L.id, `CRASHED by scenario (was LEADER of term ${L.currentTerm})`, 'crash');

@@ -149,7 +149,7 @@ function App(){
   };
 
   const clientCmd=()=>{
-    const L=W.nodes.find(n=>n.state==='leader');
+    const L=currentLeader(W.nodes);
     if(!L){ emit(W,-1,'client command REJECTED — there is no leader to accept it','deny'); return; }
     const v=String.fromCharCode(65+(W.cmdSeq++%26));
     L.log.push({ term:L.currentTerm, value:v });
@@ -280,7 +280,7 @@ function App(){
 
   /* ---- derived ---- */
   const maxTerm = Math.max(0,...W.nodes.map(n=>n.currentTerm));
-  const leader  = W.nodes.find(n=>n.state==='leader');
+  const leader  = currentLeader(W.nodes);
   const live    = W.nodes.filter(n=>n.state!=='down').length;
   const ex      = isTxn ? explainTxn(T) : explain(W);
   const q       = quorum(W.nodes.length);
