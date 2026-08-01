@@ -305,7 +305,7 @@ function App(){
         {/* h2, not h1: the page's single <h1> is the static one in
             index.html, which is what crawlers read on the first pass.
             Still a heading, so it keeps its place in the outline. */}
-        <h2>{isTxn?'🔀 Two-Phase Commit over Raft':'⚙️ Raft Consensus Visualizer'}</h2>
+        <h2>{isTxn?'Two-Phase Commit over Raft':'Raft Consensus Visualizer'}</h2>
         <span className="sub">{isTxn
           ? 'atomic commit across replicated groups · the coordinator is a Raft group too'
           : 'leader election · log replication · partitions'}</span>
@@ -327,9 +327,9 @@ function App(){
       <div className="bar">
         <span className="barlab">View</span>
         <button className={'btn '+(!isTxn?'on':'')} onClick={()=>switchView('raft')}
-          title="one Raft cluster: elections, replication, partitions">⚙️ Raft cluster</button>
+          title="one Raft cluster: elections, replication, partitions">Raft cluster</button>
         <button className={'btn '+(isTxn?'on':'')} onClick={()=>switchView('txn')}
-          title="a distributed transaction across several Raft groups">🔀 2PC over Raft</button>
+          title="a distributed transaction across several Raft groups">2PC over Raft</button>
         <span className="hint" style={{margin:0,flex:'1 1 260px',minWidth:180}}>
           {isTxn ? 'Every bubble is a full Raft group. The other view is paused where you left it.'
                  : 'The 2PC view runs this same engine, several clusters at a time.'}
@@ -338,28 +338,29 @@ function App(){
 
       <div className="bar">
         <span className="barlab">Run</span>
-        <button className="btn primary" onClick={toggleRun}>{running?'⏸ Pause':'▶ Play'}</button>
-        <button className="btn" onClick={stepOnce}>⏩ Step 120ms</button>
-        <button className="btn" onClick={stepEvent}>⏭ Next event</button>
+        <button className="btn primary" onClick={toggleRun}>{running?'❙❙\uFE0E  Pause':'▶\uFE0E  Play'}</button>
+        <button className="btn" onClick={stepOnce}>Step 120 ms</button>
+        <button className="btn" onClick={stepEvent}>Next event</button>
         <div className="sl"><span>speed</span>
           <input type="range" min="0.25" max="4" step="0.25" value={speed}
             onChange={e=>{const v=parseFloat(e.target.value); ui.current.speed=v; setSpeed(v);}}/>
           <b>{speed}×</b></div>
         <div className="sep"/>
-        <button className="btn warn" onClick={restart}>↺ Restart {isTxn&&!txnScenario?'view':'scenario'}</button>
+        <button className="btn warn" onClick={restart}>↺\uFE0E  Restart {isTxn&&!txnScenario?'view':'scenario'}</button>
       </div>
 
       {!isTxn &&
         <div className="bar">
           <span className="barlab">Cluster</span>
-          <button className={'btn '+(mode==='crash'?'on':'')} onClick={()=>setMode('crash')}>💥 Crash mode</button>
-          <button className={'btn '+(mode==='partition'?'on':'')} onClick={()=>setMode('partition')}>✂️ Partition mode</button>
-          <button className="btn" onClick={healAll}>🔗 Heal network</button>
+          <button className={'btn '+(mode==='crash'?'on':'')} onClick={()=>setMode('crash')}>Crash mode</button>
+          <button className={'btn '+(mode==='partition'?'on':'')} onClick={()=>setMode('partition')}>Partition mode</button>
+          <button className="btn" onClick={healAll}>Heal network</button>
           <div className="sep"/>
-          <button className="btn" onClick={addNode} disabled={W.nodes.length>=9}>＋ node</button>
-          <button className="btn" onClick={removeNode} disabled={W.nodes.length<=3}>－ node</button>
+          <Stepper label="Nodes" value={W.nodes.length} onAdd={addNode} onSub={removeNode}
+            addDisabled={W.nodes.length>=9} subDisabled={W.nodes.length<=3}
+            addTitle="add a node — quorum grows with the cluster"/>
           <div className="sep"/>
-          <button className="btn primary" onClick={clientCmd}>⬆ Client command</button>
+          <button className="btn primary" onClick={clientCmd}>Client command</button>
         </div>}
 
       {isTxn && <>
@@ -372,24 +373,25 @@ function App(){
             </button>
           ))}
           <div className="sep"/>
-          <button className="btn" onClick={groupAdd} disabled={!selG||selG.W.nodes.length>=7}
-            title="grows the selected group without rebuilding it — its log survives">＋ node</button>
-          <button className="btn" onClick={groupRemove} disabled={!selG||selG.W.nodes.length<=1}>－ node</button>
+          <Stepper label="Nodes" value={selG?selG.W.nodes.length:0} onAdd={groupAdd} onSub={groupRemove}
+            addDisabled={!selG||selG.W.nodes.length>=7} subDisabled={!selG||selG.W.nodes.length<=1}
+            addTitle="grows the selected group without rebuilding it — its log survives"/>
           <div className="sep"/>
-          <button className="btn" onClick={()=>setShards(-1)} disabled={T.groups.length<=2}>－ shard</button>
-          <button className="btn" onClick={()=>setShards(1)} disabled={T.groups.length>=4}>＋ shard</button>
+          <Stepper label="Shards" value={T.groups.length-1} onAdd={()=>setShards(1)} onSub={()=>setShards(-1)}
+            addDisabled={T.groups.length>=4} subDisabled={T.groups.length<=2}
+            addTitle="adding or removing a shard rebuilds it, which clears any running transaction"/>
         </div>
 
         <div className="bar">
           <span className="barlab">Transaction</span>
           <button className="btn primary" onClick={beginTransaction}
-            disabled={!!T.txn && !txnDone(T)}>⬆ Begin transaction</button>
+            disabled={!!T.txn && !txnDone(T)}>Begin transaction</button>
           <button className={'btn '+(T.groups[0].W.nodes.length>1?'on':'warn')} onClick={toggleFT}
             title="a one-node coordinator is textbook 2PC; three nodes is the fix. Rebuilds the group, so it clears any running transaction">
-            {T.groups[0].W.nodes.length>1?'✓ ':''}🛡 Replicated coordinator</button>
-          <button className={'btn '+(mode==='crash'?'on':'')} onClick={()=>setMode('crash')}>💥 Crash mode</button>
-          <button className={'btn '+(mode==='partition'?'on':'')} onClick={()=>setMode('partition')}>✂️ Partition mode</button>
-          <button className="btn" onClick={txnHeal}>🔗 Heal network</button>
+            {T.groups[0].W.nodes.length>1?'✓ ':''}Replicated coordinator</button>
+          <button className={'btn '+(mode==='crash'?'on':'')} onClick={()=>setMode('crash')}>Crash mode</button>
+          <button className={'btn '+(mode==='partition'?'on':'')} onClick={()=>setMode('partition')}>Partition mode</button>
+          <button className="btn" onClick={txnHeal}>Heal network</button>
         </div>
       </>}
 
@@ -567,3 +569,16 @@ const EVENT_COLOR = {
   /* 2PC */ prep:'#f0abfc', decide:'#34d399', block:'#ef7d7d',
 };
 const L = ({c,t})=>(<span className="it"><span className="dot" style={{background:c}}/>{t}</span>);
+
+/* One control instead of two loose buttons: the count sits between + and -,
+   so what the buttons act on is named where they are, and a topology that is
+   already at its limit greys out the side that cannot move. */
+const Stepper = ({label,value,onAdd,onSub,addDisabled,subDisabled,addTitle})=>(
+  <span className="step">
+    <button className="btn" onClick={onAdd} disabled={addDisabled}
+      title={addTitle||('add one — '+label.toLowerCase())} aria-label={'add one '+label}>+</button>
+    <span className="stepv">{label} <b>{value}</b></span>
+    <button className="btn" onClick={onSub} disabled={subDisabled}
+      title={'remove one — '+label.toLowerCase()} aria-label={'remove one '+label}>−</button>
+  </span>
+);

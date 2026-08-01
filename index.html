@@ -65,8 +65,13 @@
     --accent:#5b7cfa; --accent2:#7c93ff;
     --follower:#60a5fa; --candidate:#fbbf24; --leader:#34d399; --down:#ef4444;
     --rv:#a78bfa; --pv:#f0abfc; --ae:#38bdf8; --grant:#34d399; --deny:#f87171;
-    --ui:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;
-    --mono:ui-monospace,"SF Mono","Cascadia Code",Consolas,"Liberation Mono",monospace;
+    --ui:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable Text",
+         "Segoe UI",Inter,ui-sans-serif,system-ui,"Helvetica Neue",Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Consolas,
+         "Liberation Mono",monospace;
+    /* Controls are translucent white over the page, not their own opaque
+       greys, so one hex change re-tones every surface at once. */
+    --fill:#ffffff0a; --fill2:#ffffff14; --edge:#ffffff14; --edge2:#ffffff26;
     --sh:0 1px 2px #00000059,0 12px 28px -18px #000000a6;
     --gap:14px;
   }
@@ -82,19 +87,20 @@
       radial-gradient(760px 480px at 88% 4%,#12203f 0%,transparent 58%),
       var(--bg);
     background-repeat:no-repeat;background-attachment:fixed;
-    color:var(--txt);font-family:var(--ui);font-size:14px;
-    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+    color:var(--txt);font-family:var(--ui);font-size:14px;letter-spacing:-.006em;
+    -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+    text-rendering:optimizeLegibility}
   .app{max-width:1480px;margin:0 auto;padding:22px 20px 44px}
 
   /* ---- header ---- */
   .head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;
     padding-bottom:16px;margin-bottom:4px;border-bottom:1px solid var(--line2)}
-  .head h2{font-size:19px;margin:0;font-weight:600;letter-spacing:-.2px;
+  .head h2{font-size:19px;margin:0;font-weight:600;letter-spacing:-.022em;
     color:var(--txt);text-transform:none;padding:0;border:none}
   .head .sub{color:var(--dim);font-size:12.5px;letter-spacing:.1px}
   .stat{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;align-self:center}
-  .chip{background:var(--panel2);border:1px solid var(--line);padding:4px 10px;
-    border-radius:7px;font-size:11.5px;color:var(--dim);
+  .chip{background:var(--fill);border:1px solid var(--edge);padding:4px 10px;
+    border-radius:8px;font-size:11.5px;color:var(--dim);
     font-variant-numeric:tabular-nums;letter-spacing:.2px}
   .chip b{color:var(--txt);font-weight:600}
 
@@ -105,7 +111,9 @@
      and which is last changes with the view — hence :has() rather than a
      fixed nth-child. Browsers without :has() just get square inner corners. */
   .bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;
-    background:var(--panel);border:1px solid var(--line);
+    background:#0f1524cc;border:1px solid var(--line);
+    -webkit-backdrop-filter:blur(20px) saturate(150%);
+    backdrop-filter:blur(20px) saturate(150%);
     padding:8px 12px;margin-top:14px;border-radius:12px}
   .bar+.bar{margin-top:-1px;border-radius:0}
   .bar:not(.bar+.bar){border-radius:12px 12px 0 0}
@@ -114,12 +122,12 @@
     text-transform:uppercase;margin-right:6px;min-width:74px}
 
   /* ---- buttons ---- */
-  button.btn{background:#161d2f;color:var(--muted);border:1px solid var(--line);
-    padding:0 11px;height:30px;border-radius:8px;font-size:12.5px;cursor:pointer;
-    font-family:inherit;font-weight:600;white-space:nowrap;letter-spacing:.1px;
+  button.btn{background:var(--fill);color:var(--muted);border:1px solid var(--edge);
+    padding:0 12px;height:30px;border-radius:8px;font-size:12.5px;cursor:pointer;
+    font-family:inherit;font-weight:510;white-space:nowrap;letter-spacing:-.005em;
     display:inline-flex;align-items:center;gap:6px;
     transition:background .13s,border-color .13s,color .13s,transform .13s}
-  button.btn:hover:not(:disabled){background:#1d263c;border-color:#2c3956;
+  button.btn:hover:not(:disabled){background:var(--fill2);border-color:var(--edge2);
     color:var(--txt)}
   button.btn:active:not(:disabled){transform:translateY(1px)}
   button.btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -129,11 +137,25 @@
   button.btn.primary:hover:not(:disabled){background:linear-gradient(#3f5dd4,#3450bb);
     border-color:#5f79e8;color:#fff}
   button.btn.on{background:#0f3d31;border-color:#2b7c62;color:#a7f0d5;
-    box-shadow:inset 0 0 0 1px #ffffff0d}
+    font-weight:590;box-shadow:inset 0 0 0 1px #ffffff0d}
   button.btn.on:hover:not(:disabled){background:#12493a;border-color:#369a79;color:#c9f7e6}
   button.btn.warn{background:#3a1622;border-color:#6f2a3c;color:#ffcdd7}
   button.btn.warn:hover:not(:disabled){background:#471b2a;border-color:#8c374c;color:#ffe2e8}
   .sep{width:1px;height:20px;background:var(--line);margin:0 5px}
+
+  /* ---- stepper: [+ Nodes 5 -] ---- *
+     One control per quantity. The buttons keep .btn for their states, but
+     lose their own frame — the group draws the only border there is. */
+  .step{display:inline-flex;align-items:center;height:30px;border-radius:8px;
+    background:var(--fill);border:1px solid var(--edge);overflow:hidden}
+  .step .btn{background:transparent;border:none;border-radius:0;height:100%;
+    width:30px;padding:0;justify-content:center;font-size:15px;font-weight:400;
+    line-height:1;color:var(--muted)}
+  .step .btn:hover:not(:disabled){background:var(--fill2);color:var(--txt)}
+  .step .btn:focus-visible{outline-offset:-2px}
+  .stepv{font-size:12px;color:var(--dim);padding:0 9px;white-space:nowrap;
+    border-left:1px solid var(--edge);border-right:1px solid var(--edge)}
+  .stepv b{color:var(--txt);font-weight:590;font-variant-numeric:tabular-nums}
 
   /* ---- sliders ---- */
   .sl{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim);
@@ -157,12 +179,14 @@
   .grid{display:grid;grid-template-columns:minmax(0,1fr) 368px;gap:var(--gap);
     align-items:start;margin-top:var(--gap)}
   @media(max-width:1180px){.grid{grid-template-columns:minmax(0,1fr)}}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  .card{background:#0f1524cc;border:1px solid var(--line);border-radius:14px;
+    -webkit-backdrop-filter:blur(20px) saturate(150%);
+    backdrop-filter:blur(20px) saturate(150%);
     overflow:hidden;box-shadow:var(--sh)}
   .card+.card{margin-top:var(--gap)}
   .card h2{font-size:11px;margin:0;padding:11px 14px;color:var(--muted);
-    text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid var(--line2);
-    font-weight:700;display:flex;align-items:center;gap:8px;background:#ffffff05}
+    text-transform:uppercase;letter-spacing:.09em;border-bottom:1px solid var(--line2);
+    font-weight:590;display:flex;align-items:center;gap:8px;background:#ffffff05}
   svg.stage{display:block;width:100%;height:auto;border-radius:9px;
     background:radial-gradient(680px 460px at 50% 40%,#111a30 0%,#080d18 72%)}
   .legend{display:flex;flex-wrap:wrap;gap:7px 16px;padding:11px 14px;font-size:11.5px;
@@ -172,8 +196,8 @@
   .hint{padding:10px 14px;color:var(--dim);font-size:11.5px;line-height:1.6}
   .card>.hint{border-top:1px solid var(--line2)}
   .explain{padding:13px 14px}
-  .explain .ttl{font-size:14.5px;font-weight:600;margin-bottom:7px;
-    letter-spacing:-.1px}
+  .explain .ttl{font-size:14.5px;font-weight:590;margin-bottom:7px;
+    letter-spacing:-.014em}
   .explain .bd{font-size:12.5px;line-height:1.7;color:var(--muted)}
   .explain .bd em{color:var(--txt);font-style:normal;font-weight:600}
   .explain .why{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line);
@@ -203,9 +227,9 @@
   .tobar{height:3px;background:#0a0f1c;border-radius:3px;margin-top:7px;overflow:hidden}
   .tobar>i{display:block;height:100%;border-radius:3px}
   .mini{margin-left:auto;font-size:10.5px;padding:3px 8px;border-radius:6px;
-    cursor:pointer;border:1px solid var(--line);background:#161d2f;color:var(--muted);
+    cursor:pointer;border:1px solid var(--edge);background:var(--fill);color:var(--muted);
     font-family:inherit;transition:background .13s,color .13s}
-  .mini:hover{background:#1d263c;color:var(--txt)}
+  .mini:hover{background:var(--fill2);color:var(--txt)}
 
   /* ---- replicated logs ---- */
   .lrRow{display:flex;align-items:center;gap:10px;padding:7px 14px;
@@ -237,8 +261,8 @@
     font-size:15px;line-height:1.78}
   .about>*{max-width:74ch}
   .about h1{font-size:27px;line-height:1.25;color:var(--txt);font-weight:600;
-    letter-spacing:-.4px;margin:34px 0 12px}
-  .about h2{font-size:17px;color:var(--txt);font-weight:600;letter-spacing:-.15px;
+    letter-spacing:-.026em;margin:34px 0 12px}
+  .about h2{font-size:17px;color:var(--txt);font-weight:600;letter-spacing:-.018em;
     margin:34px 0 8px}
   .about p{margin:0 0 14px}
   .about ul{margin:0 0 14px;padding-left:20px}
