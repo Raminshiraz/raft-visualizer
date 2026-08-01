@@ -106,51 +106,63 @@ Also worth doing once: load *Shard leader dies after PREPARED*, then turn **Lead
 
 The simulation is not animation over a hand-waved state machine. It implements Figure 2 of the paper: `prevLogIndex`/`prevLogTerm` consistency checks, conflicting-entry truncation, `nextIndex[]` backtracking with fast term-skip, `matchIndex[]`, and majority commit gated on the leader's current term.
 
-To keep it honest, `npm test` loads the **same `app.js` the browser runs** and asserts the paper's four safety properties after every simulated 40ms tick, under randomized chaos — and then does the same for the 2PC layer on top of it:
+To keep it honest, `npm test` loads the **same `app.js` the browser runs** and asserts the paper's four safety properties after every simulated 40ms tick, under randomized chaos — and then does the same for the 2PC layer on top of it.
+
+Every row is **replayed across 50 seeds**, and the randomness is seeded at both ends — the engine's own `Math.random` and the chaos functions — so a run is entirely determined by its seed. That matters twice: one sample per row meant a rare safety bug passed CI most of the time, and on the run where it did not there was nothing to reproduce it with. A failing row now prints the seed that produced it:
+
+```
+FAIL  scenario: figure8Lost                 50 seeds  leader=y  maxCommit=1
+        ! seed 1 — replay with:  npm test -- --seed=1
+        ! LEADER COMPLETENESS: leader N4 lost committed index 1
+```
+
+`--seed=N` replays exactly; `--seeds=N` widens the sweep when hunting something rare.
 
 ```
 $ npm test
 Raft safety verification — engine loaded from app.js
 
-PASS  healthy cluster + client writes      leader=y  maxCommit=22
-PASS  random crash / restart               leader=y  maxCommit=13
-PASS  flapping network partitions          leader=y  maxCommit=31
-PASS  35% packet loss                      leader=y  maxCommit=7
-PASS  random link cuts (incl. one-way)     leader=y  maxCommit=17
-PASS  links + partitions + crashes + loss  leader=y  maxCommit=0
-PASS  one-way isolated node cannot win     leader=y  maxCommit=0
-PASS  scenario: fresh                      leader=y  maxCommit=8
-PASS  scenario: killLeader                 leader=y  maxCommit=6
-PASS  scenario: splitVote                  leader=y  maxCommit=7
-PASS  scenario: partition                  leader=y  maxCommit=8
-PASS  scenario: repair                     leader=y  maxCommit=13
-PASS  scenario: asymmetric                 leader=y  maxCommit=2
-PASS  scenario: figure8                    leader=y  maxCommit=10
-PASS  scenario: figure8Lost                leader=y  maxCommit=8
-PASS  prevote + links + crashes + loss     leader=n  maxCommit=0
-PASS  prevote: cut link, leader holds      term 1->1  leader held  (expected no disruption)
-PASS  prevote: one-way lo2hi, holds        term 1->1  leader held  (expected no disruption)
-PASS  prevote: one-way hi2lo, holds        term 1->1  leader held  (expected no disruption)
-PASS  no prevote: same cut disrupts        term 1->10  leader DEPOSED  (expected disruption)
-PASS  prevote: disruptor stays quiet       N4 term=0 state=follower  cluster terms=[3,3,3,3]
-PASS  prevote: re-elect after crash        median 4.2s -> 5.5s  max 16.8s -> 22.6s
-PASS  liveness: 40 cold starts             slow(>15s)=0
+PASS  healthy cluster + client writes       50 seeds  leader=y  maxCommit=22
+PASS  random crash / restart                50 seeds  leader=y  maxCommit=30
+PASS  flapping network partitions           50 seeds  leader=y  maxCommit=49
+PASS  35% packet loss                       50 seeds  leader=y  maxCommit=18
+PASS  random link cuts (incl. one-way)      50 seeds  leader=y  maxCommit=42
+PASS  links + partitions + crashes + loss   50 seeds  leader=y  maxCommit=4
+PASS  one-way isolated node cannot win      50 seeds  leader=y  maxCommit=0
+PASS  scenario: fresh                       50 seeds  leader=y  maxCommit=8
+PASS  scenario: killLeader                  50 seeds  leader=y  maxCommit=7
+PASS  scenario: splitVote                   50 seeds  leader=y  maxCommit=8
+PASS  scenario: partition                   50 seeds  leader=y  maxCommit=8
+PASS  scenario: repair                      50 seeds  leader=y  maxCommit=13
+PASS  scenario: asymmetric                  50 seeds  leader=y  maxCommit=5
+PASS  scenario: figure8                     50 seeds  leader=y  maxCommit=10
+PASS  scenario: figure8Lost                 50 seeds  leader=y  maxCommit=8
+PASS  prevote + links + crashes + loss      50 seeds  leader=y  maxCommit=33
+PASS  prevote: cut link, leader holds       50 seeds  disrupted 0/50  term 1->2  (expected no disruption every time)
+PASS  prevote: one-way lo2hi, holds         50 seeds  disrupted 0/50  term 1->2  (expected no disruption every time)
+PASS  prevote: one-way hi2lo, holds         50 seeds  disrupted 0/50  term 1->2  (expected no disruption every time)
+PASS  no prevote: same cut disrupts         50 seeds  disrupted 50/50  term 1->11  (expected disruption every time)
+PASS  prevote: disruptor stays quiet        50 seeds  worst N4 term=0  last: N4 term=0 state=follower  cluster terms=[1,1,1,1]
+PASS  prevote: re-elect after crash        median 4.2s -> 5.5s  max 12.4s -> 27.1s
+PASS  liveness: cold starts                 50 seeds  slow(>15s)=0
 
-PASS  2pc: happy path commits everywhere   phase=committed  applied=2/2  locked=0
-PASS  2pc: a NO vote aborts everywhere     phase=aborted  applied=2/2  locked=0
-PASS  2pc: shard leader dies, log answers  phase=committed  applied=2/2  locked=0
-PASS  2pc: lone coordinator BLOCKS (ctl)   locked=2/2  applied=0  (expected BLOCKED)
-PASS  2pc: replicated coord recovers       phase=committed  applied=2/2  locked=0  (expected RECOVERY)
-PASS  2pc: presumed abort on timeout       decision=abort  shard A applied=abort
-PASS  2pc: atomicity under chaos           phase=aborting  safety only, liveness not asserted
-PASS  2pc scenario: happy                  phase=committed  applied=2/2  locked=0
-PASS  2pc scenario: voteNo                 phase=aborted  applied=2/2  locked=0
-PASS  2pc scenario: shardLeaderDies        phase=committed  applied=2/2  locked=0
-PASS  2pc scenario: coordDies              phase=preparing  applied=0/2  locked=2
-PASS  2pc scenario: coordDiesFT            phase=committed  applied=2/2  locked=0
-PASS  2pc scenario: cutShard               phase=aborting  applied=1/2  locked=0
-PASS  2pc scenario: shardNoQuorum          phase=aborting  applied=1/2  locked=0
-PASS  2pc scenario: slowShard              phase=preparing  applied=0/2  locked=2
+PASS  2pc: happy path commits everywhere    50 seeds  verdict 50/50  phase=committed  applied=2/2  locked=0
+PASS  2pc: a NO vote aborts everywhere      50 seeds  verdict 50/50  phase=aborted  applied=2/2  locked=0
+PASS  2pc: shard leader dies, log answers   50 seeds  verdict 50/50  phase=committed  applied=2/2  locked=0
+PASS  2pc: lone coordinator BLOCKS (ctl)    50 seeds  verdict 50/50  locked=2/2  applied=0  (expected BLOCKED)
+PASS  2pc: crashed coord forgets its tally  50 seeds  verdict 50/50  restarted=true  tally emptied on restart=true
+PASS  2pc: replicated coord recovers        50 seeds  verdict 50/50  phase=committed  applied=2/2  locked=0  (expected RECOVERY)
+PASS  2pc: stale Prepare after apply        50 seeds  verdict 50/50  SHARD B applied=abort vote=null  vote records 0 -> 0
+PASS  2pc: presumed abort on timeout        50 seeds  verdict 50/50  decision=abort  shard A applied=abort
+PASS  2pc: atomicity under chaos            50 seeds  verdict 50/50  phase=aborted  safety only, liveness not asserted
+PASS  2pc scenario: happy                   50 seeds  verdict 50/50  phase=committed  applied=2/2  locked=0
+PASS  2pc scenario: voteNo                  50 seeds  verdict 50/50  phase=aborted  applied=2/2  locked=0
+PASS  2pc scenario: shardLeaderDies         50 seeds  verdict 50/50  phase=committed  applied=2/2  locked=0
+PASS  2pc scenario: coordDies               50 seeds  verdict 50/50  phase=preparing  applied=0/2  locked=2
+PASS  2pc scenario: coordDiesFT             50 seeds  verdict 50/50  phase=committed  applied=2/2  locked=0
+PASS  2pc scenario: cutShard                50 seeds  verdict 50/50  phase=aborting  applied=1/2  locked=0
+PASS  2pc scenario: shardNoQuorum           50 seeds  verdict 50/50  phase=aborting  applied=1/2  locked=0
+PASS  2pc scenario: slowShard               50 seeds  verdict 50/50  phase=committed  applied=2/2  locked=0
 
 ALL INVARIANTS HELD
 ```
