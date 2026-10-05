@@ -90,7 +90,7 @@ Eight more, in the second view:
 | **Commit path** | The ordering that makes it fault tolerant: `BEGIN` is committed by the coordinator's group before a single `PREPARE` goes out, and each shard commits its own vote before answering |
 | **A shard votes NO** | A refusal is Raft-committed exactly like a yes. One is enough; the shard that already locked releases |
 | **Shard leader dies after PREPARED** | The only node that ever spoke to the coordinator is crashed. Its replacement answers `PREPARED` for a transaction it never saw, out of the replicated log |
-| **Coordinator dies — one machine** | The blocking problem, reproduced. Both shards hold locks until that one machine comes back, and restarting it is the only way out. **Then turn on Replicated coordinator and load it again** |
+| **Coordinator dies — one machine** | The blocking problem, reproduced. Both shards hold locks until that one machine comes back, and restarting it is the only way out. **Then load *Coordinator dies — replicated*.** |
 | **Coordinator dies — replicated** | Same script, three-node coordinator. The volatile vote tally dies with the old leader; the durable records do not, and the transaction finishes |
 | **Coordinator cut off from a shard** | Presumed abort on the deadline. Press *Heal network* afterwards and watch the shard learn the outcome late |
 | **Shard loses quorum** | `PREPARE` arrives at a group that can never elect and dies on the ring. Raft stops rather than risk split brain; 2PC presumes abort |

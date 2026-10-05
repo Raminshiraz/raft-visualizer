@@ -72,7 +72,7 @@ const TXN_SCENARIOS = {
 
   coordDies: {
     label:'Coordinator dies — one machine',
-    note:'The coordinator is a single machine, the way textbook 2PC draws it. It crashes after both shards have voted yes and before it records a decision. Both shards are now PREPARED, both hold locks, and neither is allowed to guess — a yes vote is a promise to be able to commit, not permission to. Nothing times out, and asking each other would not help: neither shard knows any more than the other. This is the blocking problem, and no amount of retrying fixes it. It lasts exactly as long as this one machine is down — click it to restart it, and watch it find BEGIN in its log with no decision, ask again, and finish. Then switch ON Replicated coordinator and load this again: nobody has to wait for one particular machine.',
+    note:'The coordinator is a single machine, the way textbook 2PC draws it. It crashes after both shards have voted yes and before it records a decision. Both shards are now PREPARED, both hold locks, and neither is allowed to guess — a yes vote is a promise to be able to commit, not permission to. Nothing times out, and asking each other would not help: neither shard knows any more than the other. This is the blocking problem, and no amount of retrying fixes it. It lasts exactly as long as this one machine is down — click it to restart it, and watch it find BEGIN in its log with no decision, ask again, and finish. Then load Coordinator dies — replicated: the same script, and nobody has to wait for one particular machine.',
     build(cfg){
       const T = makeTxnWorld(1,[3,3],cfg);
       T.armed = script([
