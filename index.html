@@ -446,8 +446,10 @@
     rescues it would prove nothing. Known simplifications: no log compaction
     or snapshots, no joint consensus for membership changes, one transaction
     at a time, and presumed abort with no cooperative termination protocol —
-    participants never ask each other how it ended, because the blocking is
-    the point.
+    participants never ask each other how it ended. That would not unblock
+    <em>Coordinator dies — one machine</em> anyway: the crash comes after
+    every shard has voted yes and before any decision exists, so none of them
+    has anything to tell the others.
   </p>
 
   <hr />

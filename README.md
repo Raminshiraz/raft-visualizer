@@ -203,7 +203,7 @@ And for the two-phase commit view specifically:
 
 - **One transaction at a time.** No concurrency control and no lock manager beyond a per-shard flag, so there is nothing to deadlock and nothing to schedule.
 - **Presumed abort only.** No 3PC, no Paxos Commit's per-participant consensus instance — the coordinator group is the only consensus in the decision path.
-- **No cooperative termination protocol.** A blocked participant never asks the others how it ended, *because the blocking is the point.* Real implementations often add exactly that, and it turns the demo into a non-event.
+- **No cooperative termination protocol.** A blocked participant never asks the other shards how it ended. That would not rescue *Coordinator dies — one machine* anyway: the crash lands after every shard has voted yes and before any decision exists, so each shard would only learn that the others are just as in doubt. Asking around helps only when some participant already knows the outcome, or has not voted yet and can still abort — it makes blocking rarer, never impossible. The coordinator coming back is what ends it; replicating the coordinator is what avoids it.
 - **Shards do not run a state machine.** "Applied" means the shard committed a record saying so; there is no key-value store underneath to mutate.
 
 ---
