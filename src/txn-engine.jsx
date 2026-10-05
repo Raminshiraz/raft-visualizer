@@ -11,7 +11,7 @@
  *  Plain 2PC has one famous flaw: the coordinator writes its decision  *
  *  to one disk on one machine. Kill it between "collect the votes" and *
  *  "announce the outcome" and every participant sits in PREPARED,      *
- *  holding locks, forbidden to guess, forever.                        *
+ *  holding locks, forbidden to guess, until that machine comes back.  *
  *                                                                     *
  *  Gray & Lamport, "Consensus on Transaction Commit" (2006): make      *
  *  every decision a consensus-replicated log record instead of one     *
@@ -319,7 +319,9 @@ function coordinatorStep(T){
       t.votes = {}; t.acks = {};
       t.deadline  = T.clock + PREPARE_TIMEOUT;
       t.lastRetry = T.clock - TXN_RETRY;
-      emitT(T, 0, `COORD leader is now N${L.id} — the in-memory vote tally died with the old one, the durable records did not`, 'block');
+      emitT(T, 0, T.coordLeader === L.id
+        ? `N${L.id} leads COORD again — the vote tally it held in memory did not survive, its log did`
+        : `COORD leader is now N${L.id} — the in-memory vote tally died with the old one, the durable records did not`, 'block');
     }
     T.coordLeader = L.id;
   }

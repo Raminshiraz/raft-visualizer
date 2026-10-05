@@ -82,8 +82,11 @@ function explainTxn(T){
 
   if(!cl && locked.length){
     const solo = g0.W.nodes.length===1;
+    // A restarted solo coordinator spends a whole election timeout leaderless,
+    // so "no leader" alone does not mean it is still down.
+    const back = solo && g0.W.nodes[0].state!=='down';
     return { ttl:`BLOCKED — ${locked.length} shard${locked.length>1?'s hold':' holds'} locks and nobody can decide`, tone:'var(--down)',
-      bd:`${locked.map(g=>g.name).join(' and ')} ${locked.length>1?'have':'has'} voted yes and taken locks. The coordinator group has no leader, so no decision can be recorded and none can be announced. ${solo?'It is a <em>single machine</em>, so there is no second copy of anything.':`Its ${g0.W.nodes.length} nodes cannot reach a quorum.`} The shards are not allowed to guess: a yes vote is a promise that they <em>can</em> commit, never permission to.`,
+      bd:`${locked.map(g=>g.name).join(' and ')} ${locked.length>1?'have':'has'} voted yes and taken locks. The coordinator group has no leader, so no decision can be recorded and none can be announced. ${solo?`It is a <em>single machine</em>, so there is no second copy of anything — ${back?'it has restarted, and the moment it leads again it re-reads its log and carries on':'restart it and it recovers from its own log, but nothing else can'}.`:`Its ${g0.W.nodes.length} nodes cannot reach a quorum.`} The shards are not allowed to guess: a yes vote is a promise that they <em>can</em> commit, never permission to.`,
       why:'This is 2PC\'s famous blocking window. The participants have promised, and only the coordinator may release them. Put the coordinator behind Raft — add nodes to it — and the promise outlives the machine that took it.' };
   }
   if(!cl) return { ttl:'COORD has no leader — 2PC is paused', tone:'var(--candidate)',
