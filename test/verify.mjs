@@ -564,22 +564,36 @@ runTxn('2pc: crashed coord forgets its tally', () => buildTxn(1, [3, 3]), 90000,
    permanent. Bring the SAME machine back and it has to finish out of its log
    alone -- BEGIN is there and no decision is, so it asks again and the shards
    answer from their own committed logs. Both shards must still be locked at
-   the restart, or a transaction that finished some other way would pass. */
-runTxn('2pc: lone coord recovers on restart', () => buildTxn(1, [3, 3]), 90000,
-  (T, t) => {
-    if (t === 2000) X.beginTxn(T);
-    once(T, '_k', () => T.txn && allVotedYes(T), () => { T.groups[0].W.nodes[0].state = 'down'; });
-    once(T, '_r', () => T._k && t > 20000, () => {
-      T._held = shardsOf(T).every(g => X.shardFate(T, g).locked);
-      const n = T.groups[0].W.nodes[0];
-      n.state = 'follower'; n.votes = {}; n.preVotes = {}; n.preVoteTerm = 0;
-      n.phase = null; n.leaderId = null; n.lastHeard = 9000;
-    });
-  },
-  i => ({
-    ok: i.T._r && i.T._held && i.phase === 'committed' && i.applied === i.shards && i.locked === 0,
-    text: `${tally(i)}  (expected RECOVERY once restarted)`,
-  }));
+   the restart, or a transaction that finished some other way would pass. And
+   its log must hold no decision when it crashes, or re-announcing one would
+   pass for asking again.
+
+   Also run with Leader no-op off. The restarted machine then writes nothing in
+   its own term before it asks, so it can only move because its commitIndex
+   survived the crash -- a restart that zeroed it would never commit BEGIN,
+   which is from an older term. Nothing else pins that. */
+for (const noop of [true, false])
+  runTxn(noop ? '2pc: lone coord recovers on restart' : '2pc: lone coord recovers, no-op off',
+    () => buildTxn(1, [3, 3], { noop }), 90000,
+    (T, t) => {
+      if (t === 2000) X.beginTxn(T);
+      once(T, '_k', () => T.txn && allVotedYes(T), () => {
+        const n = T.groups[0].W.nodes[0];
+        T._undecided = !n.log.some(e => e.txn === T.txn.id && e.rec === 'decision');
+        n.state = 'down';
+      });
+      once(T, '_r', () => T._k && t > 20000, () => {
+        T._held = shardsOf(T).every(g => X.shardFate(T, g).locked);
+        const n = T.groups[0].W.nodes[0];
+        n.state = 'follower'; n.votes = {}; n.preVotes = {}; n.preVoteTerm = 0;
+        n.phase = null; n.leaderId = null; n.lastHeard = 9000;
+      });
+    },
+    i => ({
+      ok: i.T._r && i.T._held && i.T._undecided
+        && i.phase === 'committed' && i.applied === i.shards && i.locked === 0,
+      text: `${tally(i)}  (expected RECOVERY once restarted)`,
+    }));
 
 runTxn('2pc: replicated coord recovers', () => buildTxn(3, [3, 3]), 90000,
   (T, t) => {
