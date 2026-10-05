@@ -388,8 +388,11 @@
     the coordinator is a single machine, start a transaction, and crash it
     once both shards show a lock. Every participant has promised it can
     commit, none of them is allowed to guess, and the only node that could
-    release them is gone. Nothing times out. Nothing recovers. That is the
-    <strong>blocking problem</strong>, and retrying harder does not fix it.
+    release them is gone. Nothing times out, and nothing else can step in.
+    That is the <strong>blocking problem</strong>, and retrying harder does
+    not fix it. It is not permanent — click the coordinator to restart it and
+    it reads its own log and finishes the transaction — but it lasts exactly
+    as long as that one machine is down.
   </p>
   <p>
     The fix, from Gray and Lamport's <em>Consensus on Transaction Commit</em>,
@@ -402,8 +405,9 @@
     group. Watch the row of boxes under each bubble — faded and dashed while
     the record is merely written, solid once it is durable. Nothing is ever
     said out loud before its box goes solid. Now crash the coordinator's
-    leader again: a new one is elected, reads the decision straight out of the
-    replicated log, and finishes the transaction the dead machine started.
+    leader again: a new one is elected, reads how far the transaction got
+    straight out of the replicated log, and finishes what the dead machine
+    started — without waiting for it to come back.
     Crash a <em>shard</em> leader the instant its vote commits and the same
     thing happens on the other side — its replacement answers
     <code>PREPARED</code> for a transaction it has never heard of.
