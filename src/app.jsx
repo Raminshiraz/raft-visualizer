@@ -225,8 +225,28 @@ function App(){
     emitT(T,-1,'network healed — every group reconnected and every internal link restored','sys');
   };
 
+  /* The single-cluster stepper's rule, applied per group (each group is its
+     own Raft cluster), plus one that only a one-node group needs. Two clicks
+     give a lone coordinator an empty majority:
+       - while it is down, the two new nodes elect a leader that has never
+         seen BEGIN and run the transaction again from scratch. If the dead
+         machine had already committed a decision they can commit the other
+         one, and restarting it then overwrites its record;
+       - for an election timeout after it restarts there is no leader to catch
+         them up, and if a new node times out first it wins and truncates the
+         restarted node's committed log. Measured: 125/200 runs lost a
+         committed entry with both clicks at the restart, 24/200 two seconds
+         after it.
+     So nothing may be down, and once the group has committed anything it
+     needs a leader too. That also keeps restarting the lone coordinator the
+     only way out of its blocking window, which is what the scenario says. */
+  const resizeBlocked = g =>
+    g.W.nodes.some(n=>n.state==='down') ? RESIZE_BLOCKED
+    : !groupLeader(g) && g.W.nodes.some(n=>n.commitIndex>0) ? RESIZE_LEADERLESS
+    : null;
+
   const groupAdd=()=>{
-    const g=T.groups[sel]; if(!g || g.W.nodes.length>=7) return;
+    const g=T.groups[sel]; if(!g || g.W.nodes.length>=7 || resizeBlocked(g)) return;
     const t=Math.max(0,...g.W.nodes.map(n=>n.currentTerm));
     const n=addNodeTo(g.W,t);
     emit(g.W,n.id,`joins — quorum is now ${quorum(g.W.nodes.length)}/${g.W.nodes.length}`,'sys');
@@ -234,7 +254,7 @@ function App(){
       (g.role==='coord'&&g.W.nodes.length===2?', and it is no longer a single point of failure':''),'sys');
   };
   const groupRemove=()=>{
-    const g=T.groups[sel]; if(!g || g.W.nodes.length<=1) return;
+    const g=T.groups[sel]; if(!g || g.W.nodes.length<=1 || resizeBlocked(g)) return;
     const n=removeNodeFrom(g.W);
     emitT(T,sel,`N${n.id} removed from ${g.name} — quorum is now ${quorum(g.W.nodes.length)}/${g.W.nodes.length}`+
       (g.role==='coord'&&g.W.nodes.length===1?', and it is a single point of failure again':''),'sys');
@@ -310,6 +330,7 @@ function App(){
 
   const selG    = T.groups[Math.min(sel,T.groups.length-1)];
   const selLead = selG && groupLeader(selG);
+  const selBlk  = selG && resizeBlocked(selG);
   const txnPh   = isTxn ? txnPhase(T) : null;
   const nLocks  = isTxn ? txnLocked(T).length : 0;
   const note    = isTxn ? T.note : W.note;
@@ -398,8 +419,9 @@ function App(){
           ))}
           <div className="sep"/>
           <Stepper label="Nodes" value={selG?selG.W.nodes.length:0} onAdd={groupAdd} onSub={groupRemove}
-            addDisabled={!selG||selG.W.nodes.length>=7} subDisabled={!selG||selG.W.nodes.length<=1}
-            addTitle="grows the selected group without rebuilding it — its log survives"/>
+            addDisabled={!selG||selG.W.nodes.length>=7||!!selBlk} subDisabled={!selG||selG.W.nodes.length<=1||!!selBlk}
+            addTitle={selBlk||'grows the selected group without rebuilding it — its log survives'}
+            subTitle={selBlk||undefined}/>
           <div className="sep"/>
           <Stepper label="Shards" value={T.groups.length-1} onAdd={()=>setShards(1)} onSub={()=>setShards(-1)}
             addDisabled={T.groups.length>=4} subDisabled={T.groups.length<=2}
@@ -600,6 +622,10 @@ const L = ({c,t})=>(<span className="it"><span className="dot" style={{backgroun
 const RESIZE_BLOCKED =
   'restart every crashed node first — resizing while one is down is not modelled '
   + 'safely here (no joint consensus), and it can lose a committed entry';
+// 2PC groups only — see resizeBlocked.
+const RESIZE_LEADERLESS =
+  'wait for this group to elect a leader — new nodes join with empty logs, and with '
+  + 'nobody to catch them up they can outvote the log and lose a committed entry';
 
 const Stepper = ({label,value,onAdd,onSub,addDisabled,subDisabled,addTitle,subTitle})=>(
   <span className="step">
