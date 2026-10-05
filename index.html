@@ -429,8 +429,9 @@
     it. In the 2PC view the topology is yours to change: pick a group and add
     or remove nodes — up to seven, down to one — and its log survives the
     resize, so you can grow a group in the middle of a live transaction and
-    watch its quorum change under it — unless one of its nodes is down, or it
-    is between leaders. New nodes join with empty logs, and with nobody to
+    watch its quorum change under it — unless one of its nodes is down, it is
+    split by a partition, or it is between leaders. New nodes join with empty
+    logs, and with nobody to
     catch them up, enough of them could outvote the log and erase what it had
     committed. Adding or removing whole shards rebuilds
     them, so that discards the transaction in progress and says so in the log.
