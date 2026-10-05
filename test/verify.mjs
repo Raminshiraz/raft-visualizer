@@ -560,6 +560,27 @@ runTxn('2pc: crashed coord forgets its tally', () => buildTxn(1, [3, 3]), 90000,
     text: `restarted=${!!i.T._r}  tally emptied on restart=${i.T._empty === true}`,
   }));
 
+/* The other half of the negative control: the blocking is unbounded, not
+   permanent. Bring the SAME machine back and it has to finish out of its log
+   alone -- BEGIN is there and no decision is, so it asks again and the shards
+   answer from their own committed logs. Both shards must still be locked at
+   the restart, or a transaction that finished some other way would pass. */
+runTxn('2pc: lone coord recovers on restart', () => buildTxn(1, [3, 3]), 90000,
+  (T, t) => {
+    if (t === 2000) X.beginTxn(T);
+    once(T, '_k', () => T.txn && allVotedYes(T), () => { T.groups[0].W.nodes[0].state = 'down'; });
+    once(T, '_r', () => T._k && t > 20000, () => {
+      T._held = shardsOf(T).every(g => X.shardFate(T, g).locked);
+      const n = T.groups[0].W.nodes[0];
+      n.state = 'follower'; n.votes = {}; n.preVotes = {}; n.preVoteTerm = 0;
+      n.phase = null; n.leaderId = null; n.lastHeard = 9000;
+    });
+  },
+  i => ({
+    ok: i.T._r && i.T._held && i.phase === 'committed' && i.applied === i.shards && i.locked === 0,
+    text: `${tally(i)}  (expected RECOVERY once restarted)`,
+  }));
+
 runTxn('2pc: replicated coord recovers', () => buildTxn(3, [3, 3]), 90000,
   (T, t) => {
     if (t === 2000) X.beginTxn(T);

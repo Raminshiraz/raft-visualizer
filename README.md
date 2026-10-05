@@ -151,6 +151,7 @@ PASS  2pc: a NO vote aborts everywhere      50 seeds  verdict 50/50  phase=abort
 PASS  2pc: shard leader dies, log answers   50 seeds  verdict 50/50  phase=committed  applied=2/2  locked=0
 PASS  2pc: lone coordinator BLOCKS (ctl)    50 seeds  verdict 50/50  locked=2/2  applied=0  (expected BLOCKED)
 PASS  2pc: crashed coord forgets its tally  50 seeds  verdict 50/50  restarted=true  tally emptied on restart=true
+PASS  2pc: lone coord recovers on restart   50 seeds  verdict 50/50  phase=committed  applied=2/2  locked=0  (expected RECOVERY once restarted)
 PASS  2pc: replicated coord recovers        50 seeds  verdict 50/50  phase=committed  applied=2/2  locked=0  (expected RECOVERY)
 PASS  2pc: stale Prepare after apply        50 seeds  verdict 50/50  SHARD B applied=abort vote=null  vote records 0 -> 0
 PASS  2pc: presumed abort on timeout        50 seeds  verdict 50/50  decision=abort  shard A applied=abort
@@ -169,7 +170,7 @@ ALL INVARIANTS HELD
 
 The PreVote rows are the ones to read as a pair. `no prevote: same cut disrupts` is a deliberate **negative control**: cutting one link from the leader must knock it out of office when PreVote is off, or the three rows above it — which assert the leader survives that same cut with PreVote on — would pass without proving anything.
 
-`2pc: lone coordinator BLOCKS (ctl)` is the second deliberate negative control, and it earns its keep the same way. An unreplicated coordinator, crashed once both shards have voted yes, **must** leave them locked and unable to finish. Without that row, `2pc: replicated coord recovers` would prove nothing — a transaction that would have completed anyway also completes with replication on.
+`2pc: lone coordinator BLOCKS (ctl)` is the second deliberate negative control, and it earns its keep the same way. An unreplicated coordinator, crashed once both shards have voted yes, **must** leave them locked and unable to finish for as long as it stays down. Without that row, `2pc: replicated coord recovers` would prove nothing — a transaction that would have completed anyway also completes with replication on. `2pc: lone coord recovers on restart` is the other half: bring that same machine back and it **must** finish out of its own log, which is what makes the blocking unbounded rather than permanent.
 
 Checked continuously:
 
